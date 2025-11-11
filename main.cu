@@ -1,5 +1,4 @@
-// CC3086 - Lab 9: Chat-Box con IA (CUDA)
-// Demostración: NLU ligero + Analítica sensores + Fusión, con streams y eventos.
+// CC3086 - Lab 9: Chat-Box con IA (CUDA) 
 // Compilar: nvcc -O3 -std=c++17 main.cu -o chatbox_cuda
 
 #include <cuda_runtime.h>
@@ -14,59 +13,16 @@
 #include <fstream>
 #include <numeric>
 #include <iomanip>
+#include <sstream>
 
-// ------------------------ Utilidades ------------------------
-
-// Calcula percentil p en un vector (0..100). Copia/ordena localmente.
-static double percentile(std::vector<float> v, double p){
-  if (v.empty()) return 0.0;
-  std::sort(v.begin(), v.end());
-  double r = (p/100.0)*(v.size()-1);
-  size_t lo = (size_t)std::floor(r), hi = (size_t)std::ceil(r);
-  if (lo == hi) return v[lo];
-  double w = r - lo;
-  return (1.0 - w)*v[lo] + w*v[hi];
-}
-
-// Extrae TOP-K (host) desde scores[K]
-static std::vector<int> topk_indices(const float* scores, int K, int k){
-  std::vector<int> idx(K);
-  std::iota(idx.begin(), idx.end(), 0);
-  std::partial_sort(idx.begin(), idx.begin()+std::min(k,K), idx.end(),
-                    [&](int a, int b){ return scores[a] > scores[b]; });
-  idx.resize(std::min(k,K));
-  return idx;
-}
-
-// Abre CSV y escribe encabezado
-static void open_metrics_csv(std::ofstream& ofs, const std::string& path){
-  ofs.open(path, std::ios::out);
-  ofs << "query_id,query_text,top_intent,decision,new_alarm,new_luces,new_vent,new_desh,"
-         "mean_mov,mean_lux,mean_temp,mean_ruido,mean_hum,"
-         "lat_total_ms,lat_nlu_ms,lat_data_ms,lat_fuse_ms\n";
-}
-
-// Anexa fila CSV
-static void append_metrics_csv(std::ofstream& ofs,
-                               int qid, const std::string& qtext,
-                               const std::string& top_intent, int decision,
-                               int new_alarm, int new_luces, int new_vent, int new_desh,
-                               const float meanC[5],
-                               float t_total, float t_nlu, float t_data, float t_fuse){
-  ofs << qid << ","
-      << "\"" << qtext << "\"" << ","
-      << top_intent << ","
-      << decision << ","
-      << new_alarm << ","
-      << new_luces << ","
-      << new_vent  << ","
-      << new_desh  << ","
-      << std::fixed << std::setprecision(3)
-      << meanC[0] << "," << meanC[1] << "," << meanC[2] << ","
-      << meanC[3] << "," << meanC[4] << ","
-      << std::setprecision(3)
-      << t_total << "," << t_nlu << "," << t_data << "," << t_fuse << "\n";
-}
+// ======================== CONFIGURACIÓN ========================
+constexpr int D = 8192;
+constexpr int K = 5;
+constexpr int TOPK = 3;
+constexpr int MAX_QUERY = 512;
+constexpr int C = 5;
+constexpr int N = 1<<20;
+constexpr int W = 1024;
 
 #define CUDA_OK(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char *file, int line){
@@ -78,18 +34,8 @@ inline void gpuAssert(cudaError_t code, const char *file, int line){
 
 inline int ceilDiv(int a, int b){ return (a + b - 1) / b; }
 
-// ------------------------ Parámetros ------------------------
-constexpr int D = 8192;    // dimensión de representación
-constexpr int K = 5;       // #intenciones
-constexpr int TOPK = 3;
-constexpr int MAX_QUERY = 512;
+// ======================== KERNELS ========================
 
-// Sensores (los 5 del proyecto 2)
-constexpr int C = 5;
-constexpr int N = 1<<20;
-constexpr int W = 1024;
-
-// ------------------------ Hash 3-gramas ------------------------
 __device__ __forceinline__
 uint32_t hash3(uint8_t a, uint8_t b, uint8_t c){
   uint32_t h = 2166136261u;
@@ -99,10 +45,8 @@ uint32_t hash3(uint8_t a, uint8_t b, uint8_t c){
   return h % D;
 }
 
-// ------------------------ Kernels NLU ------------------------
 __global__
-void tokenize3grams(const char* __restrict__ query, int n,
-                    float* __restrict__ vq){
+void tokenize3grams(const char* __restrict__ query, int n, float* __restrict__ vq){
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i+2 >= n) return;
   uint32_t idx = hash3((uint8_t)query[i], (uint8_t)query[i+1], (uint8_t)query[i+2]);
@@ -140,10 +84,8 @@ void matvecDotCos(const float* __restrict__ M, const float* __restrict__ vq,
   scores[k] = acc;
 }
 
-// ------------------------ Kernels Sensores ------------------------
 __global__
-void window_stats_last(const float* __restrict__ X,
-                       int N, int C, int W,
+void window_stats_last(const float* __restrict__ X, int N, int C, int W,
                        float* __restrict__ mean_out, float* __restrict__ std_out){
   int c = blockIdx.x;
   if (c >= C) return;
@@ -173,7 +115,6 @@ void window_stats_last(const float* __restrict__ X,
   }
 }
 
-// ------------------------ Kernel Fusión / Decisión ------------------------
 enum Intent {
   TOGGLE_ALARMA = 0,
   TOGGLE_LUCES = 1,
@@ -182,21 +123,6 @@ enum Intent {
   CONSULTAR_ESTADO = 4
 };
 
-static const std::array<std::vector<std::string>, K> TEMPLATES = {{
-  // TOGGLE_ALARMA
-  {"activar alarma", "apagar alarma", "alarma on", "alarma off", "encender alarma", "desactivar alarma", "prender alarma", "silenciar alarma", "sonar alarma"},
-  // TOGGLE_LUCES
-  {"prender luces", "apagar luces", "encender iluminacion", "luces afuera", "luz exterior", "iluminar entrada", "activar luces", "desactivar luces"},
-  // TOGGLE_VENTILADOR
-  {"encender ventilador", "apagar ventilador", "activar ventilacion", "ventilador on", "ventilador off", "encender enfriamiento"},
-  // TOGGLE_DESHUMIDIFICADOR
-  {"activar deshumidificador", "apagar deshumidificador", "deshumidificador on", "deshumidificador off", "reducir humedad"},
-  // CONSULTAR_ESTADO
-  {"como esta la casa", "estado del sistema", "que esta encendido", "resumen", "status general", "datos de sensores", "estado de la casa", "resumen de registros", "estadisticas del sistema"}
-}};
-
-// meanC: medias recientes por canal [mov, luz, temp, ruido, hum]
-// scores: similitud por intención (K)
 __global__
 void fuseDecision(const float* __restrict__ scores, int K,
                   const float* __restrict__ meanC,
@@ -208,76 +134,50 @@ void fuseDecision(const float* __restrict__ scores, int K,
                   int* __restrict__ newVent,  int* __restrict__ newDesh)
 {
   __shared__ int topIdx;
-
   if (threadIdx.x == 0){ topIdx = 0; }
   __syncthreads();
-
   if (threadIdx.x == 0){
     int best = 0;
     float bestv = scores[0];
     for (int k = 1; k < K; ++k){
-      float s = scores[k];
-      if (s > bestv){ bestv = s; best = k; }
+      if (scores[k] > bestv){ bestv = scores[k]; best = k; }
     }
     topIdx = best;
   }
   __syncthreads();
-
   if (threadIdx.x == 0){
     *outTop = topIdx;
-
-    // Lee medias recientes para reglas
-    float mov   = meanC[0];         // 0/1
-    float luz   = meanC[1];         // lux
-    float temp  = meanC[2];         // °C
-    float ruido = meanC[3];         // dB
-    float hum   = meanC[4];         // 0..1
-
-    // Estados actuales
-    int sAlarm = *curAlarm;
-    int sLuces = *curLuces;
-    int sVent  = *curVent;
-    int sDesh  = *curDesh;
-
+    float mov   = meanC[0];
+    float luz   = meanC[1];
+    float temp  = meanC[2];
+    float ruido = meanC[3];
+    float hum   = meanC[4];
+    int sAlarm = *curAlarm, sLuces = *curLuces, sVent = *curVent, sDesh = *curDesh;
     int nAlarm = sAlarm, nLuces = sLuces, nVent = sVent, nDesh = sDesh;
-
-    // Señales por sensor
-    bool oscuro   = (luz <  thrLuz);
-    bool caliente = (temp > thrTemp);
-    bool ruidoso  = (ruido > thrRuido);
-    bool humedo   = (hum >  thrHum);
-    bool hayMov   = (mov >= 0.5f);
-
+    bool oscuro = (luz < thrLuz), caliente = (temp > thrTemp);
+    bool ruidoso = (ruido > thrRuido), humedo = (hum > thrHum);
+    bool hayMov = (mov >= 0.5f);
     switch (topIdx){
       case TOGGLE_ALARMA:
-        if (hayMov || ruidoso) nAlarm = 1;
-        else nAlarm = 1 - sAlarm;
+        nAlarm = (hayMov || ruidoso) ? 1 : (1 - sAlarm);
         break;
       case TOGGLE_LUCES:
-        if (oscuro) nLuces = 1;
-        else nLuces = 1 - sLuces;
+        nLuces = oscuro ? 1 : (1 - sLuces);
         break;
       case TOGGLE_VENTILADOR:
-        if (caliente) nVent = 1;
-        else nVent = 1 - sVent;
+        nVent = caliente ? 1 : (1 - sVent);
         break;
       case TOGGLE_DESHUMIDIFICADOR:
-        if (humedo) nDesh = 1;
-        else nDesh = 1 - sDesh;
+        nDesh = humedo ? 1 : (1 - sDesh);
         break;
-      case CONSULTAR_ESTADO:
-      default:
-        break;
+      default: break;
     }
-
-    *newAlarm = nAlarm;
-    *newLuces = nLuces;
-    *newVent  = nVent;
-    *newDesh  = nDesh;
+    *newAlarm = nAlarm; *newLuces = nLuces; *newVent = nVent; *newDesh = nDesh;
   }
 }
 
-// ------------------------ Host helpers ------------------------
+// ======================== HOST HELPERS ========================
+
 static inline uint32_t hash3_host(uint8_t a, uint8_t b, uint8_t c){
   uint32_t h = 2166136261u;
   h = (h ^ a) * 16777619u;
@@ -290,32 +190,41 @@ static void l2normalize_host(std::vector<float>& v){
   double acc = 0.0;
   for (float x : v) acc += double(x)*double(x);
   float n = float(std::sqrt(acc) + 1e-12);
-  if (n == 0.f) return;
   for (auto& x : v) x /= n;
 }
 
 static void tokenize3grams_host(const std::string& s, std::vector<float>& out){
-  std::string q = s;
-  if (q.size() < 3) return;
-  for (size_t i = 0; i + 2 < q.size(); ++i){
-    uint32_t idx = hash3_host((uint8_t)q[i], (uint8_t)q[i+1], (uint8_t)q[i+2]);
+  if (s.size() < 3) return;
+  for (size_t i = 0; i + 2 < s.size(); ++i){
+    uint32_t idx = hash3_host((uint8_t)s[i], (uint8_t)s[i+1], (uint8_t)s[i+2]);
     out[idx] += 1.0f;
   }
 }
 
-// Construye M[K x D]: promedia frases por intención y normaliza filas
-static void buildIntentMatrixFromTemplates(std::vector<float>& M){
+static const std::array<std::vector<std::string>, K> TEMPLATES = {{
+  {"activar alarma", "apagar alarma", "alarma on", "alarma off", "encender alarma"},
+  {"prender luces", "apagar luces", "encender iluminacion", "luces afuera"},
+  {"encender ventilador", "apagar ventilador", "activar ventilacion"},
+  {"activar deshumidificador", "apagar deshumidificador", "reducir humedad"},
+  {"como esta la casa", "estado del sistema", "resumen", "datos de sensores"}
+}};
+
+static const char* intentNames[K] = {
+  "TOGGLE_ALARMA", "TOGGLE_LUCES", "TOGGLE_VENTILADOR",
+  "TOGGLE_DESHUMIDIFICADOR", "CONSULTAR_ESTADO"
+};
+
+static void buildIntentMatrix(std::vector<float>& M){
   M.assign(K * D, 0.f);
   for (int k = 0; k < K; ++k){
     std::vector<float> row(D, 0.f);
-    const auto& phrases = TEMPLATES[k];
-    for (const auto& p : phrases){
+    for (const auto& p : TEMPLATES[k]){
       std::vector<float> v(D, 0.f);
       tokenize3grams_host(p, v);
       l2normalize_host(v);
       for (int j = 0; j < D; ++j) row[j] += v[j];
     }
-    float inv = phrases.empty() ? 1.f : (1.f / phrases.size());
+    float inv = TEMPLATES[k].empty() ? 1.f : (1.f / TEMPLATES[k].size());
     for (int j = 0; j < D; ++j) row[j] *= inv;
     {
       double acc=0.0; for (float x:row) acc += double(x)*double(x);
@@ -326,323 +235,409 @@ static void buildIntentMatrixFromTemplates(std::vector<float>& M){
   }
 }
 
-void initIntentPrototypes(std::vector<float>& M){
-  buildIntentMatrixFromTemplates(M);
+// TOP-K con índices
+static std::vector<int> topk_indices(const float* scores, int K, int k){
+  std::vector<int> idx(K);
+  std::iota(idx.begin(), idx.end(), 0);
+  std::partial_sort(idx.begin(), idx.begin()+std::min(k,K), idx.end(),
+                    [&](int a, int b){ return scores[a] > scores[b]; });
+  idx.resize(std::min(k,K));
+  return idx;
 }
 
-std::string demoQuery(){
-  return "apaga las luces";
-}
-
-// Simulación de sensores
 void synthSensors(std::vector<float>& X){
   X.resize(size_t(N)*C);
-
   srand(12345);
-
   int burstLen = 0;
-  const int minBurst = 50;
-  const int maxBurst = 500;
-  const float pStartBurst = 0.001f;
-
-  const float luxBaseMin = 50.f;
-  const float luxBaseMax = 800.f;
-
-  const float tempMean = 27.0f;
-  const float tempJitter = 3.0f;
-
-  const float noiseBaseMin = 35.f, noiseBaseMax = 45.f;
-  const float noiseSpikeMin = 65.f, noiseSpikeMax = 85.f;
-  const float pNoiseSpike = 0.0008f;
-
-  float humidity = 55.f;
-  const float humMin = 40.f, humMax = 70.f;
-
   for (int i = 0; i < N; ++i){
     int motion = 0;
-    if (burstLen > 0){
-      motion = 1;
-      burstLen--;
-    } else {
-      float r = (rand() % 10000) / 10000.f;
-      if (r < pStartBurst){
-        burstLen = minBurst + (rand() % (maxBurst - minBurst + 1));
-        motion = 1;
-        burstLen--;
-      }
-    }
-
-    float phase = (i % (1<<16)) * (2.f * 3.14159265f / float(1<<16));
-    float diurnal = 0.5f * (1.f + sinf(phase));
-    float lux = luxBaseMin + diurnal * (luxBaseMax - luxBaseMin);
-    lux += ((rand()%1000)/1000.f - 0.5f) * 30.f;
+    if (burstLen > 0){ motion = 1; burstLen--; }
+    else if ((rand()%10000)/10000.f < 0.001f){ burstLen = 50 + rand()%450; motion = 1; burstLen--; }
+    float phase = (i%(1<<16))*(2.f*3.14159265f/float(1<<16));
+    float lux = 50.f + 0.5f*(1.f+sinf(phase))*750.f + ((rand()%1000)/1000.f - 0.5f)*30.f;
     if (lux < 0.f) lux = 0.f;
-
-    float temp = tempMean + ((rand()%1000)/1000.f - 0.5f) * (2.f*tempJitter);
-
-    float noise = noiseBaseMin + (rand()%1000)/1000.f * (noiseBaseMax - noiseBaseMin);
-    float rp = (rand()%100000) / 100000.f;
-    if (rp < pNoiseSpike){
-      noise = noiseSpikeMin + (rand()%1000)/1000.f * (noiseSpikeMax - noiseSpikeMin);
-    }
-
-    humidity += ((rand()%1000)/1000.f - 0.5f) * 0.2f;
-    if (humidity < humMin) humidity = humMin + 0.5f;
-    if (humidity > humMax) humidity = humMax - 0.5f;
-
+    float temp = 27.0f + ((rand()%1000)/1000.f - 0.5f)*6.f;
+    float noise = 35.f + (rand()%1000)/1000.f*10.f;
+    if ((rand()%100000)/100000.f < 0.0008f) noise = 65.f + (rand()%1000)/1000.f*20.f;
+    float hum = 55.f + ((rand()%1000)/1000.f - 0.5f)*0.2f;
     X[i*C + 0] = float(motion);
     X[i*C + 1] = lux;
     X[i*C + 2] = temp;
     X[i*C + 3] = noise;
-    X[i*C + 4] = humidity;
+    X[i*C + 4] = hum;
   }
 }
 
-// ------------------------ Main ------------------------
-int main(){
-  cudaStream_t sNLU, sDATA, sFUSE;
-  CUDA_OK(cudaStreamCreate(&sNLU));
-  CUDA_OK(cudaStreamCreate(&sDATA));
-  CUDA_OK(cudaStreamCreate(&sFUSE));
+static double percentile(std::vector<float> v, double p){
+  if (v.empty()) return 0.0;
+  std::sort(v.begin(), v.end());
+  double r = (p/100.0)*(v.size()-1);
+  size_t lo = (size_t)std::floor(r), hi = (size_t)std::ceil(r);
+  if (lo == hi) return v[lo];
+  double w = r - lo;
+  return (1.0 - w)*v[lo] + w*v[hi];
+}
 
-  cudaEvent_t evStart, evStop;
-  CUDA_OK(cudaEventCreate(&evStart));
-  CUDA_OK(cudaEventCreate(&evStop));
+// ======================== QUERY CONTEXT ========================
+struct QueryContext {
+  char *d_query;
+  float *d_vq, *d_scores, *h_scores;
+  float *d_X, *d_mean, *d_std, *h_mean;
+  int *d_stateAlarm, *d_stateLuces, *d_stateVent, *d_stateDesh;
+  int *d_newAlarm, *d_newLuces, *d_newVent, *d_newDesh;
+  int *d_top;
+  float *d_meanC;
+  cudaEvent_t ev_start, ev_end;
+  cudaEvent_t ev_nlu_start, ev_nlu_end;
+  cudaEvent_t ev_data_start, ev_data_end;
+  cudaEvent_t ev_fuse_start, ev_fuse_end;
+};
 
-  // Eventos por etapa (NLU/DATA/FUSE)
-  cudaEvent_t evNLUStart, evNLUStop, evDATAStart, evDATAStop, evFUSEStart, evFUSEStop;
-  CUDA_OK(cudaEventCreate(&evNLUStart));
-  CUDA_OK(cudaEventCreate(&evNLUStop));
-  CUDA_OK(cudaEventCreate(&evDATAStart));
-  CUDA_OK(cudaEventCreate(&evDATAStop));
-  CUDA_OK(cudaEventCreate(&evFUSEStart));
-  CUDA_OK(cudaEventCreate(&evFUSEStop));
+void allocateQueryContext(QueryContext& ctx){
+  CUDA_OK(cudaMalloc(&ctx.d_query, MAX_QUERY));
+  CUDA_OK(cudaMalloc(&ctx.d_vq, D*sizeof(float)));
+  CUDA_OK(cudaMalloc(&ctx.d_scores, K*sizeof(float)));
+  CUDA_OK(cudaHostAlloc(&ctx.h_scores, K*sizeof(float), cudaHostAllocDefault));
+  CUDA_OK(cudaMalloc(&ctx.d_X, size_t(N)*C*sizeof(float)));
+  CUDA_OK(cudaMalloc(&ctx.d_mean, C*sizeof(float)));
+  CUDA_OK(cudaMalloc(&ctx.d_std, C*sizeof(float)));
+  CUDA_OK(cudaHostAlloc(&ctx.h_mean, C*sizeof(float), cudaHostAllocDefault));
+  CUDA_OK(cudaMalloc(&ctx.d_meanC, C*sizeof(float)));
+  CUDA_OK(cudaMalloc(&ctx.d_stateAlarm, sizeof(int)));
+  CUDA_OK(cudaMalloc(&ctx.d_stateLuces, sizeof(int)));
+  CUDA_OK(cudaMalloc(&ctx.d_stateVent, sizeof(int)));
+  CUDA_OK(cudaMalloc(&ctx.d_stateDesh, sizeof(int)));
+  CUDA_OK(cudaMalloc(&ctx.d_newAlarm, sizeof(int)));
+  CUDA_OK(cudaMalloc(&ctx.d_newLuces, sizeof(int)));
+  CUDA_OK(cudaMalloc(&ctx.d_newVent, sizeof(int)));
+  CUDA_OK(cudaMalloc(&ctx.d_newDesh, sizeof(int)));
+  CUDA_OK(cudaMalloc(&ctx.d_top, sizeof(int)));
+  CUDA_OK(cudaEventCreate(&ctx.ev_start));
+  CUDA_OK(cudaEventCreate(&ctx.ev_end));
+  CUDA_OK(cudaEventCreate(&ctx.ev_nlu_start));
+  CUDA_OK(cudaEventCreate(&ctx.ev_nlu_end));
+  CUDA_OK(cudaEventCreate(&ctx.ev_data_start));
+  CUDA_OK(cudaEventCreate(&ctx.ev_data_end));
+  CUDA_OK(cudaEventCreate(&ctx.ev_fuse_start));
+  CUDA_OK(cudaEventCreate(&ctx.ev_fuse_end));
+}
 
-  std::vector<float> hM; initIntentPrototypes(hM);
-  float *dM=nullptr;
-  CUDA_OK(cudaMalloc(&dM, K*D*sizeof(float)));
-  CUDA_OK(cudaMemcpy(dM, hM.data(), K*D*sizeof(float), cudaMemcpyHostToDevice));
+void freeQueryContext(QueryContext& ctx){
+  cudaFree(ctx.d_query); cudaFree(ctx.d_vq); cudaFree(ctx.d_scores);
+  cudaFree(ctx.d_X); cudaFree(ctx.d_mean); cudaFree(ctx.d_std); cudaFree(ctx.d_meanC);
+  cudaFree(ctx.d_stateAlarm); cudaFree(ctx.d_stateLuces);
+  cudaFree(ctx.d_stateVent); cudaFree(ctx.d_stateDesh);
+  cudaFree(ctx.d_newAlarm); cudaFree(ctx.d_newLuces);
+  cudaFree(ctx.d_newVent); cudaFree(ctx.d_newDesh); cudaFree(ctx.d_top);
+  cudaFreeHost(ctx.h_scores); cudaFreeHost(ctx.h_mean);
+  cudaEventDestroy(ctx.ev_start); cudaEventDestroy(ctx.ev_end);
+  cudaEventDestroy(ctx.ev_nlu_start); cudaEventDestroy(ctx.ev_nlu_end);
+  cudaEventDestroy(ctx.ev_data_start); cudaEventDestroy(ctx.ev_data_end);
+  cudaEventDestroy(ctx.ev_fuse_start); cudaEventDestroy(ctx.ev_fuse_end);
+}
 
-  // Conjunto de consultas
-  std::vector<std::string> QUERIES = {
-    "activa la alarma",
-    "apaga la alarma",
-    "enciende luces exteriores",
-    "apaga luces",
-    "activa el ventilador",
-    "apaga el ventilador",
-    "activa el deshumidificador",
-    "consulta estado",
-    "muestra mediciones",
-    "enciende luces si esta oscuro"
-  };
+// ======================== RESULTADOS ========================
+struct QueryResult {
+  std::string query;
+  int top_intent;
+  std::vector<int> topk_intents;
+  int decision;
+  int new_alarm, new_luces, new_vent, new_desh;
+  float mean_sensors[C];
+  float lat_total_ms, lat_nlu_ms, lat_data_ms, lat_fuse_ms;
+};
+
+// ======================== BENCHMARK ========================
+struct BenchResult {
+  int num_streams;
+  double p50_ms, p95_ms, qps;
+  double avg_nlu_ms, avg_data_ms, avg_fuse_ms;
+  std::vector<QueryResult> query_results;
+};
+
+BenchResult runBenchmark(int num_streams, const std::vector<std::string>& QUERIES, 
+                         float *d_M, const std::vector<float>& h_sensorData){
   const int Q = (int)QUERIES.size();
-
-  // Buffer host/device para la query (reutilizable por iteración)
-  char *hQ=nullptr; CUDA_OK(cudaHostAlloc(&hQ, MAX_QUERY, cudaHostAllocDefault));
-  char *dQ=nullptr; CUDA_OK(cudaMalloc(&dQ, MAX_QUERY));
-
-  // CSV de métricas
-  std::ofstream metricsCsv;
-  open_metrics_csv(metricsCsv, "metrics.csv");
-
-  // Acumuladores para percentiles
-  std::vector<float> all_total_ms, all_nlu_ms, all_data_ms, all_fuse_ms;
-  all_total_ms.reserve(Q);
-  all_nlu_ms.reserve(Q);
-  all_data_ms.reserve(Q);
-  all_fuse_ms.reserve(Q);
-
-  float *hVQ=nullptr, *dVQ=nullptr, *dScores=nullptr, *hScores=nullptr;
-  CUDA_OK(cudaHostAlloc(&hVQ, D*sizeof(float), cudaHostAllocDefault));
-  CUDA_OK(cudaHostAlloc(&hScores, K*sizeof(float), cudaHostAllocDefault));
-  CUDA_OK(cudaMalloc(&dVQ, D*sizeof(float)));
-  CUDA_OK(cudaMalloc(&dScores, K*sizeof(float)));
-
-  std::vector<float> hXvec; synthSensors(hXvec);
-  float *hX=nullptr; CUDA_OK(cudaHostAlloc(&hX, size_t(N)*C*sizeof(float), cudaHostAllocDefault));
-  memcpy(hX, hXvec.data(), size_t(N)*C*sizeof(float));
-
-  float *dX=nullptr, *dMean=nullptr, *dStd=nullptr;
-  float hMean[C]={0}, hStd[C]={0};
-  CUDA_OK(cudaMalloc(&dX, size_t(N)*C*sizeof(float)));
-  CUDA_OK(cudaMalloc(&dMean, C*sizeof(float)));
-  CUDA_OK(cudaMalloc(&dStd,  C*sizeof(float)));
-
-  // Estados actuales persistentes (entre queries)
-  int hStateAlarm = 0, hStateLuces = 0, hStateVent = 0, hStateDesh = 0;
-
-  // Nombres de intenciones (para logs)
-  static const char* intentNames[K] = {
-    "TOGGLE_ALARMA",
-    "TOGGLE_LUCES",
-    "TOGGLE_VENTILADOR",
-    "TOGGLE_DESHUMIDIFICADOR",
-    "CONSULTAR_ESTADO"
-  };
-
-  // Procesamiento por múltiples consultas
+  
+  std::vector<cudaStream_t> streams(num_streams);
+  for (int i = 0; i < num_streams; ++i) CUDA_OK(cudaStreamCreate(&streams[i]));
+  
+  std::vector<QueryContext> contexts(num_streams);
+  for (auto& ctx : contexts) allocateQueryContext(ctx);
+  
+  int h_alarm = 0, h_luces = 0, h_vent = 0, h_desh = 0;
+  
+  std::vector<float> all_total, all_nlu, all_data, all_fuse;
+  std::vector<QueryResult> results;
+  
   for (int qi = 0; qi < Q; ++qi){
+    int sid = qi % num_streams;
+    cudaStream_t s = streams[sid];
+    QueryContext& ctx = contexts[sid];
+    
     std::string q = QUERIES[qi];
-    std::transform(q.begin(), q.end(), q.begin(),
-                  [](unsigned char c){ return std::tolower(c); });
-    const int qn = std::min<int>((int)q.size(), MAX_QUERY);
-    memset(hQ, 0, MAX_QUERY);
-    memcpy(hQ, q.data(), qn);
-
-    // --------- TIMING total ---------
-    CUDA_OK(cudaEventRecord(evStart, 0));
-
-    // ===================== NLU =====================
-    CUDA_OK(cudaEventRecord(evNLUStart, sNLU));
-
-    CUDA_OK(cudaMemsetAsync(dVQ, 0, D*sizeof(float), sNLU));
-    CUDA_OK(cudaMemcpyAsync(dQ, hQ, MAX_QUERY, cudaMemcpyHostToDevice, sNLU));
-
-    {
-      dim3 blk(256), grd(ceilDiv(qn, (int)blk.x));
-      tokenize3grams<<<grd, blk, 0, sNLU>>>(dQ, qn, dVQ);
-    }
-    l2normalize<<<1,256,0,sNLU>>>(dVQ, D);
-    {
-      dim3 blk(128), grd(ceilDiv(K,(int)blk.x));
-      matvecDotCos<<<grd, blk, 0, sNLU>>>(dM, dVQ, dScores, K, D);
-    }
-    CUDA_OK(cudaMemcpyAsync(hScores, dScores, K*sizeof(float), cudaMemcpyDeviceToHost, sNLU));
-
-    CUDA_OK(cudaEventRecord(evNLUStop, sNLU));
-
-    // ===================== DATA =====================
-    CUDA_OK(cudaEventRecord(evDATAStart, sDATA));
-
-    // (re-sintetiza sensores por consulta para simular variación)
-    std::vector<float> hXvecIter; hXvecIter.reserve((size_t)N*C);
-    synthSensors(hXvecIter);
-    memcpy(hX, hXvecIter.data(), size_t(N)*C*sizeof(float));
-
-    CUDA_OK(cudaMemcpyAsync(dX, hX, size_t(N)*C*sizeof(float), cudaMemcpyHostToDevice, sDATA));
-    window_stats_last<<<C, 256, 0, sDATA>>>(dX, N, C, W, dMean, dStd);
-    CUDA_OK(cudaMemcpyAsync(hMean, dMean, C*sizeof(float), cudaMemcpyDeviceToHost, sDATA));
-    CUDA_OK(cudaMemcpyAsync(hStd,  dStd,  C*sizeof(float), cudaMemcpyDeviceToHost, sDATA));
-
-    CUDA_OK(cudaEventRecord(evDATAStop, sDATA));
-    CUDA_OK(cudaStreamSynchronize(sDATA));
-
-    // ===================== FUSE =====================
-    CUDA_OK(cudaEventRecord(evFUSEStart, sFUSE));
-
-    // meanC en device
-    float *dMeanHost=nullptr;
-    CUDA_OK(cudaMalloc(&dMeanHost, C*sizeof(float)));
-    CUDA_OK(cudaMemcpyAsync(dMeanHost, hMean, C*sizeof(float), cudaMemcpyHostToDevice, sFUSE));
-
-    const float thrLuz   = 250.0f;
-    const float thrTemp  = 27.0f;
-    const float thrRuido = 60.0f;
-    const float thrHum   = 0.60f;
-
-    int *dStateAlarm=nullptr, *dStateLuces=nullptr, *dStateVent=nullptr, *dStateDesh=nullptr;
-    int *dNewAlarm=nullptr, *dNewLuces=nullptr, *dNewVent=nullptr, *dNewDesh=nullptr;
-    CUDA_OK(cudaMalloc(&dStateAlarm, sizeof(int)));
-    CUDA_OK(cudaMalloc(&dStateLuces, sizeof(int)));
-    CUDA_OK(cudaMalloc(&dStateVent,  sizeof(int)));
-    CUDA_OK(cudaMalloc(&dStateDesh,  sizeof(int)));
-    CUDA_OK(cudaMalloc(&dNewAlarm, sizeof(int)));
-    CUDA_OK(cudaMalloc(&dNewLuces, sizeof(int)));
-    CUDA_OK(cudaMalloc(&dNewVent,  sizeof(int)));
-    CUDA_OK(cudaMalloc(&dNewDesh,  sizeof(int)));
-
-    CUDA_OK(cudaMemcpyAsync(dStateAlarm, &hStateAlarm, sizeof(int), cudaMemcpyHostToDevice, sFUSE));
-    CUDA_OK(cudaMemcpyAsync(dStateLuces, &hStateLuces, sizeof(int), cudaMemcpyHostToDevice, sFUSE));
-    CUDA_OK(cudaMemcpyAsync(dStateVent,  &hStateVent,  sizeof(int), cudaMemcpyHostToDevice, sFUSE));
-    CUDA_OK(cudaMemcpyAsync(dStateDesh,  &hStateDesh,  sizeof(int), cudaMemcpyHostToDevice, sFUSE));
-    CUDA_OK(cudaStreamSynchronize(sFUSE));
-
-    int *dTop=nullptr; CUDA_OK(cudaMalloc(&dTop, sizeof(int)));
-
-    fuseDecision<<<1, 128, 0, sFUSE>>>(
-      dScores, K,
-      dMeanHost,
-      thrLuz, thrTemp, thrRuido, thrHum,
-      dStateAlarm, dStateLuces, dStateVent, dStateDesh,
-      dTop,
-      dNewAlarm, dNewLuces, dNewVent, dNewDesh
+    std::transform(q.begin(), q.end(), q.begin(), [](unsigned char c){ return std::tolower(c); });
+    int qn = std::min<int>((int)q.size(), MAX_QUERY);
+    
+    char h_query[MAX_QUERY] = {0};
+    memcpy(h_query, q.data(), qn);
+    
+    CUDA_OK(cudaEventRecord(ctx.ev_start, s));
+    
+    // === NLU ===
+    CUDA_OK(cudaEventRecord(ctx.ev_nlu_start, s));
+    CUDA_OK(cudaMemsetAsync(ctx.d_vq, 0, D*sizeof(float), s));
+    CUDA_OK(cudaMemcpyAsync(ctx.d_query, h_query, MAX_QUERY, cudaMemcpyHostToDevice, s));
+    tokenize3grams<<<ceilDiv(qn,256), 256, 0, s>>>(ctx.d_query, qn, ctx.d_vq);
+    l2normalize<<<1, 256, 0, s>>>(ctx.d_vq, D);
+    matvecDotCos<<<ceilDiv(K,128), 128, 0, s>>>(d_M, ctx.d_vq, ctx.d_scores, K, D);
+    CUDA_OK(cudaMemcpyAsync(ctx.h_scores, ctx.d_scores, K*sizeof(float), cudaMemcpyDeviceToHost, s));
+    CUDA_OK(cudaEventRecord(ctx.ev_nlu_end, s));
+    
+    // === DATA ===
+    CUDA_OK(cudaEventRecord(ctx.ev_data_start, s));
+    CUDA_OK(cudaMemcpyAsync(ctx.d_X, h_sensorData.data(), size_t(N)*C*sizeof(float), cudaMemcpyHostToDevice, s));
+    window_stats_last<<<C, 256, 0, s>>>(ctx.d_X, N, C, W, ctx.d_mean, ctx.d_std);
+    CUDA_OK(cudaMemcpyAsync(ctx.d_meanC, ctx.d_mean, C*sizeof(float), cudaMemcpyDeviceToDevice, s));
+    CUDA_OK(cudaMemcpyAsync(ctx.h_mean, ctx.d_mean, C*sizeof(float), cudaMemcpyDeviceToHost, s));
+    CUDA_OK(cudaEventRecord(ctx.ev_data_end, s));
+    
+    // === FUSE ===
+    CUDA_OK(cudaEventRecord(ctx.ev_fuse_start, s));
+    CUDA_OK(cudaMemcpyAsync(ctx.d_stateAlarm, &h_alarm, sizeof(int), cudaMemcpyHostToDevice, s));
+    CUDA_OK(cudaMemcpyAsync(ctx.d_stateLuces, &h_luces, sizeof(int), cudaMemcpyHostToDevice, s));
+    CUDA_OK(cudaMemcpyAsync(ctx.d_stateVent, &h_vent, sizeof(int), cudaMemcpyHostToDevice, s));
+    CUDA_OK(cudaMemcpyAsync(ctx.d_stateDesh, &h_desh, sizeof(int), cudaMemcpyHostToDevice, s));
+    
+    fuseDecision<<<1, 128, 0, s>>>(
+      ctx.d_scores, K, ctx.d_meanC,
+      250.f, 27.f, 60.f, 0.60f,
+      ctx.d_stateAlarm, ctx.d_stateLuces, ctx.d_stateVent, ctx.d_stateDesh,
+      ctx.d_top,
+      ctx.d_newAlarm, ctx.d_newLuces, ctx.d_newVent, ctx.d_newDesh
     );
-
-    int hTop=-1, hNewAlarm=0, hNewLuces=0, hNewVent=0, hNewDesh=0;
-    CUDA_OK(cudaMemcpyAsync(&hTop,      dTop,       sizeof(int), cudaMemcpyDeviceToHost, sFUSE));
-    CUDA_OK(cudaMemcpyAsync(&hNewAlarm, dNewAlarm,  sizeof(int), cudaMemcpyDeviceToHost, sFUSE));
-    CUDA_OK(cudaMemcpyAsync(&hNewLuces, dNewLuces,  sizeof(int), cudaMemcpyDeviceToHost, sFUSE));
-    CUDA_OK(cudaMemcpyAsync(&hNewVent,  dNewVent,   sizeof(int), cudaMemcpyDeviceToHost, sFUSE));
-    CUDA_OK(cudaMemcpyAsync(&hNewDesh,  dNewDesh,   sizeof(int), cudaMemcpyDeviceToHost, sFUSE));
-
-    CUDA_OK(cudaEventRecord(evFUSEStop, sFUSE));
-    CUDA_OK(cudaStreamSynchronize(sFUSE));
-
-    int prevAlarm = hStateAlarm, prevLuces = hStateLuces, prevVent = hStateVent, prevDesh = hStateDesh;
-
-    hStateAlarm = hNewAlarm;
-    hStateLuces = hNewLuces;
-    hStateVent  = hNewVent;
-    hStateDesh  = hNewDesh;
-
-    // --------- TIMING total ---------
-    CUDA_OK(cudaEventRecord(evStop, 0));
-    CUDA_OK(cudaEventSynchronize(evStop));
-
-    // ---- Métricas por etapa y totales ----
-    float msNLU=0.f, msDATA=0.f, msFUSE=0.f, msTOTAL=0.f;
-    CUDA_OK(cudaEventElapsedTime(&msNLU,  evNLUStart,  evNLUStop));
-    CUDA_OK(cudaEventElapsedTime(&msDATA, evDATAStart, evDATAStop));
-    CUDA_OK(cudaEventElapsedTime(&msFUSE, evFUSEStart, evFUSEStop));
-    CUDA_OK(cudaEventElapsedTime(&msTOTAL, evStart, evStop));
-
-    all_nlu_ms.push_back(msNLU);
-    all_data_ms.push_back(msDATA);
-    all_fuse_ms.push_back(msFUSE);
-    all_total_ms.push_back(msTOTAL);
-
-    // TOP-K de sugerencias (host)
-    auto top3 = topk_indices(hScores, K, TOPK);
-
-    int decision = (prevAlarm != hNewAlarm) || (prevLuces != hNewLuces) || (prevVent != hNewVent) || (prevDesh != hNewDesh);
-    append_metrics_csv(metricsCsv, qi, q, intentNames[hTop], decision,
-                      hNewAlarm, hNewLuces, hNewVent, hNewDesh,
-                      hMean, msTOTAL, msNLU, msDATA, msFUSE);
-
-    // Limpieza por iteración
-    cudaFree(dTop);
-    cudaFree(dMeanHost);
-    cudaFree(dStateAlarm); cudaFree(dStateLuces); cudaFree(dStateVent); cudaFree(dStateDesh);
-    cudaFree(dNewAlarm);   cudaFree(dNewLuces);   cudaFree(dNewVent);   cudaFree(dNewDesh);
+    
+    int h_top, h_new[4];
+    CUDA_OK(cudaMemcpyAsync(&h_top, ctx.d_top, sizeof(int), cudaMemcpyDeviceToHost, s));
+    CUDA_OK(cudaMemcpyAsync(&h_new[0], ctx.d_newAlarm, sizeof(int), cudaMemcpyDeviceToHost, s));
+    CUDA_OK(cudaMemcpyAsync(&h_new[1], ctx.d_newLuces, sizeof(int), cudaMemcpyDeviceToHost, s));
+    CUDA_OK(cudaMemcpyAsync(&h_new[2], ctx.d_newVent, sizeof(int), cudaMemcpyDeviceToHost, s));
+    CUDA_OK(cudaMemcpyAsync(&h_new[3], ctx.d_newDesh, sizeof(int), cudaMemcpyDeviceToHost, s));
+    CUDA_OK(cudaEventRecord(ctx.ev_fuse_end, s));
+    
+    CUDA_OK(cudaEventRecord(ctx.ev_end, s));
+    CUDA_OK(cudaStreamSynchronize(s));
+    
+    // Guardar resultado
+    QueryResult qr;
+    qr.query = QUERIES[qi];
+    qr.top_intent = h_top;
+    qr.topk_intents = topk_indices(ctx.h_scores, K, TOPK);
+    qr.decision = (h_new[0] != h_alarm || h_new[1] != h_luces || h_new[2] != h_vent || h_new[3] != h_desh) ? 1 : 0;
+    qr.new_alarm = h_new[0]; qr.new_luces = h_new[1]; qr.new_vent = h_new[2]; qr.new_desh = h_new[3];
+    for (int i = 0; i < C; ++i) qr.mean_sensors[i] = ctx.h_mean[i];
+    
+    float ms_total, ms_nlu, ms_data, ms_fuse;
+    CUDA_OK(cudaEventElapsedTime(&ms_total, ctx.ev_start, ctx.ev_end));
+    CUDA_OK(cudaEventElapsedTime(&ms_nlu, ctx.ev_nlu_start, ctx.ev_nlu_end));
+    CUDA_OK(cudaEventElapsedTime(&ms_data, ctx.ev_data_start, ctx.ev_data_end));
+    CUDA_OK(cudaEventElapsedTime(&ms_fuse, ctx.ev_fuse_start, ctx.ev_fuse_end));
+    
+    qr.lat_total_ms = ms_total;
+    qr.lat_nlu_ms = ms_nlu;
+    qr.lat_data_ms = ms_data;
+    qr.lat_fuse_ms = ms_fuse;
+    
+    results.push_back(qr);
+    
+    all_total.push_back(ms_total);
+    all_nlu.push_back(ms_nlu);
+    all_data.push_back(ms_data);
+    all_fuse.push_back(ms_fuse);
+    
+    h_alarm = h_new[0]; h_luces = h_new[1]; h_vent = h_new[2]; h_desh = h_new[3];
   }
+  
+  for (auto& ctx : contexts) freeQueryContext(ctx);
+  for (auto& s : streams) CUDA_OK(cudaStreamDestroy(s));
+  
+  BenchResult res;
+  res.num_streams = num_streams;
+  res.p50_ms = percentile(all_total, 50.0);
+  res.p95_ms = percentile(all_total, 95.0);
+  double sum_ms = std::accumulate(all_total.begin(), all_total.end(), 0.0);
+  res.qps = (sum_ms > 0) ? (1000.0 * Q / sum_ms) : 0.0;
+  res.avg_nlu_ms = std::accumulate(all_nlu.begin(), all_nlu.end(), 0.0) / Q;
+  res.avg_data_ms = std::accumulate(all_data.begin(), all_data.end(), 0.0) / Q;
+  res.avg_fuse_ms = std::accumulate(all_fuse.begin(), all_fuse.end(), 0.0) / Q;
+  res.query_results = results;
+  
+  return res;
+}
 
-  // Resumen (p50/p95) y QPS
-  double p50 = percentile(all_total_ms, 50.0);
-  double p95 = percentile(all_total_ms, 95.0);
-
-  double sum_ms = std::accumulate(all_total_ms.begin(), all_total_ms.end(), 0.0);
-  double qps = (sum_ms>0.0) ? (1000.0 * Q / sum_ms) : 0.0;
-
-  printf("Total queries: %d | QPS ~ %.2f\n", Q, qps);
-  printf("Lat p50=%.3f ms | p95=%.3f ms\n", p50, p95);
-  printf("Etapas (promedio): NLU=%.3f ms | DATA=%.3f ms | FUSE=%.3f ms\n",
-        std::accumulate(all_nlu_ms.begin(),  all_nlu_ms.end(),  0.0)/Q,
-        std::accumulate(all_data_ms.begin(), all_data_ms.end(), 0.0)/Q,
-        std::accumulate(all_fuse_ms.begin(), all_fuse_ms.end(), 0.0)/Q);
-
-  metricsCsv.close();
-  cudaFree(dQ);
-  cudaFree(dVQ); cudaFree(dScores); cudaFree(dM);
-  cudaFree(dX);  cudaFree(dMean);   cudaFree(dStd);
-  cudaFreeHost(hQ); cudaFreeHost(hVQ); cudaFreeHost(hScores); cudaFreeHost(hX);
-  cudaEventDestroy(evNLUStart);
-  cudaEventDestroy(evNLUStop);
-  cudaEventDestroy(evDATAStart);
-  cudaEventDestroy(evDATAStop);
-  cudaEventDestroy(evFUSEStart);
-  cudaEventDestroy(evFUSEStop);
-  cudaEventDestroy(evStart); cudaEventDestroy(evStop);
-  cudaStreamDestroy(sNLU); cudaStreamDestroy(sDATA); cudaStreamDestroy(sFUSE);
+// ======================== MAIN ========================
+int main(){
+  printf("╔═══════════════════════════════════════════════════════════╗\n");
+  printf("║  LAB 9 - CHAT-BOX CUDA CON MÚLTIPLES STREAMS             ║\n");
+  printf("║  Smart Home System                                        ║\n");
+  printf("╚═══════════════════════════════════════════════════════════╝\n\n");
+  
+  // Preparar matriz de intenciones
+  printf("[1/4] Construyendo matriz de intenciones desde templates...\n");
+  std::vector<float> h_M;
+  buildIntentMatrix(h_M);
+  float *d_M = nullptr;
+  CUDA_OK(cudaMalloc(&d_M, K*D*sizeof(float)));
+  CUDA_OK(cudaMemcpy(d_M, h_M.data(), K*D*sizeof(float), cudaMemcpyHostToDevice));
+  printf("       Matriz M [%dx%d] construida desde %d intenciones\n\n", K, D, K);
+  
+  // Generar datos de sensores
+  printf("[2/4] Generando datos sintéticos de sensores...\n");
+  std::vector<float> h_sensorData;
+  synthSensors(h_sensorData);
+  printf("       Generados %d samples × %d canales (%.2f MB)\n\n", 
+         N, C, (N*C*sizeof(float))/(1024.0*1024.0));
+  
+  // Queries de prueba
+  std::vector<std::string> QUERIES = {
+    "activa la alarma", "apaga la alarma",
+    "enciende luces exteriores", "apaga luces",
+    "activa el ventilador", "apaga el ventilador",
+    "activa el deshumidificador", "apaga deshumidificador",
+    "consulta estado", "muestra mediciones",
+    "enciende luces si esta oscuro", "estado del sistema",
+    "alarma on", "ventilador off", "como esta la casa"
+  };
+  
+  printf("[3/4] Ejecutando benchmark con múltiples configuraciones...\n\n");
+  
+  // Benchmark con diferentes configuraciones
+  std::vector<int> configs = {1, 2, 4, 8};
+  std::vector<BenchResult> bench_results;
+  
+  for (int ns : configs){
+    printf("   → Configuración: %d stream(s)\n", ns);
+    BenchResult r = runBenchmark(ns, QUERIES, d_M, h_sensorData);
+    bench_results.push_back(r);
+    printf("     p50=%.3fms | p95=%.3fms | QPS=%.2f\n", r.p50_ms, r.p95_ms, r.qps);
+    printf("     Etapas: NLU=%.3fms | DATA=%.3fms | FUSE=%.3fms\n\n", 
+           r.avg_nlu_ms, r.avg_data_ms, r.avg_fuse_ms);
+  }
+  
+  printf("[4/4] Generando archivos de salida...\n");
+  
+  // Guardar benchmark_results.csv
+  std::ofstream csv("benchmark_results.csv");
+  csv << "num_streams,p50_ms,p95_ms,qps,avg_nlu_ms,avg_data_ms,avg_fuse_ms\n";
+  for (const auto& r : bench_results){
+    csv << r.num_streams << "," << std::fixed << std::setprecision(3)
+        << r.p50_ms << "," << r.p95_ms << "," << r.qps << ","
+        << r.avg_nlu_ms << "," << r.avg_data_ms << "," << r.avg_fuse_ms << "\n";
+  }
+  csv.close();
+  printf("      benchmark_results.csv\n");
+  
+  // Guardar metrics.csv con TODOS los detalles de la primera configuración
+  std::ofstream mcsv("metrics.csv");
+  mcsv << "query_id,query_text,top_intent,top_k_intents,decision,"
+          "new_alarm,new_luces,new_vent,new_desh,"
+          "mean_mov,mean_lux,mean_temp,mean_ruido,mean_hum,"
+          "lat_total_ms,lat_nlu_ms,lat_data_ms,lat_fuse_ms\n";
+  
+  // Usar resultados de la primera configuración (1 stream) para metrics detallado
+  const auto& first_bench = bench_results[0];
+  for (size_t qi = 0; qi < first_bench.query_results.size(); ++qi){
+    const auto& qr = first_bench.query_results[qi];
+    
+    // Construir string con top-k intents
+    std::stringstream topk_str;
+    topk_str << "\"";
+    for (size_t i = 0; i < qr.topk_intents.size(); ++i){
+      topk_str << intentNames[qr.topk_intents[i]];
+      if (i < qr.topk_intents.size() - 1) topk_str << ";";
+    }
+    topk_str << "\"";
+    
+    mcsv << qi << ",\"" << qr.query << "\","
+         << intentNames[qr.top_intent] << ","
+         << topk_str.str() << ","
+         << qr.decision << ","
+         << qr.new_alarm << "," << qr.new_luces << "," 
+         << qr.new_vent << "," << qr.new_desh << ","
+         << std::fixed << std::setprecision(3)
+         << qr.mean_sensors[0] << "," << qr.mean_sensors[1] << ","
+         << qr.mean_sensors[2] << "," << qr.mean_sensors[3] << ","
+         << qr.mean_sensors[4] << ","
+         << qr.lat_total_ms << "," << qr.lat_nlu_ms << ","
+         << qr.lat_data_ms << "," << qr.lat_fuse_ms << "\n";
+  }
+  mcsv.close();
+  printf("      ✓ metrics.csv\n");
+  
+  // Resumen en consola
+  printf("\n╔═══════════════════════════════════════════════════════════╗\n");
+  printf("║   BENCHMARK COMPLETADO                                  ║\n");
+  printf("╚═══════════════════════════════════════════════════════════╝\n\n");
+  
+  printf("Resumen de resultados:\n");
+  printf("─────────────────────────────────────────────────────────────\n");
+  printf(" Streams │   p50 (ms) │   p95 (ms) │    QPS  │  Speedup\n");
+  printf("─────────────────────────────────────────────────────────────\n");
+  
+  double baseline_qps = bench_results[0].qps;
+  for (const auto& r : bench_results){
+    double speedup = r.qps / baseline_qps;
+    printf("   %2d    │   %7.3f  │   %7.3f  │  %6.2f │  %5.2fx\n",
+           r.num_streams, r.p50_ms, r.p95_ms, r.qps, speedup);
+  }
+  printf("─────────────────────────────────────────────────────────────\n\n");
+  
+  printf("Desglose promedio por etapa (config: 1 stream):\n");
+  printf("  • NLU:  %.3f ms (%.1f%%)\n", 
+         bench_results[0].avg_nlu_ms,
+         100.0 * bench_results[0].avg_nlu_ms / bench_results[0].p50_ms);
+  printf("  • DATA: %.3f ms (%.1f%%)\n",
+         bench_results[0].avg_data_ms,
+         100.0 * bench_results[0].avg_data_ms / bench_results[0].p50_ms);
+  printf("  • FUSE: %.3f ms (%.1f%%)\n\n",
+         bench_results[0].avg_fuse_ms,
+         100.0 * bench_results[0].avg_fuse_ms / bench_results[0].p50_ms);
+  
+  printf("Ejemplos de queries procesadas:\n");
+  printf("─────────────────────────────────────────────────────────────\n");
+  for (size_t i = 0; i < std::min<size_t>(5, first_bench.query_results.size()); ++i){
+    const auto& qr = first_bench.query_results[i];
+    printf("[%zu] \"%s\"\n", i, qr.query.c_str());
+    printf("    Intent: %s (Top-3: ", intentNames[qr.top_intent]);
+    for (size_t j = 0; j < qr.topk_intents.size(); ++j){
+      printf("%s", intentNames[qr.topk_intents[j]]);
+      if (j < qr.topk_intents.size()-1) printf(", ");
+    }
+    printf(")\n");
+    printf("    Sensores: mov=%.1f lux=%.0f temp=%.1f°C ruido=%.0fdB hum=%.0f%%\n",
+           qr.mean_sensors[0], qr.mean_sensors[1], qr.mean_sensors[2],
+           qr.mean_sensors[3], qr.mean_sensors[4]);
+    printf("    Acción: Alarm=%d Luces=%d Vent=%d Desh=%d (cambio=%s)\n",
+           qr.new_alarm, qr.new_luces, qr.new_vent, qr.new_desh,
+           qr.decision ? "SÍ" : "NO");
+    printf("    Latencia: %.3fms (NLU=%.3f DATA=%.3f FUSE=%.3f)\n\n",
+           qr.lat_total_ms, qr.lat_nlu_ms, qr.lat_data_ms, qr.lat_fuse_ms);
+  }
+  printf("─────────────────────────────────────────────────────────────\n\n");
+  
+  printf("Archivos generados:\n");
+  printf("  1. benchmark_results.csv - Comparación de 1/2/4/8 streams\n");
+  printf("  2. metrics.csv          - Métricas detalladas por query\n\n");
+  
+  printf("Siguiente paso:\n");
+  printf("   python generate_plots.py\n");
+  printf("   Revisar gráficas generadas (PNG)\n\n");
+  
+  cudaFree(d_M);
+  
+  printf("╔═══════════════════════════════════════════════════════════╗\n");
+  printf("║  Chat-Box CUDA finalizado exitosamente                   ║\n");
+  printf("╚═══════════════════════════════════════════════════════════╝\n");
+  
   return 0;
 }
