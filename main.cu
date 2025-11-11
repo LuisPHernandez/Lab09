@@ -1,6 +1,7 @@
-// CC3086 - Lab 9: Chat-Box con IA (CUDA)
-// Demostración: NLU ligero + Analítica sensores + Fusión, con streams y eventos.
+// CC3086 - Lab 9: Chat-Box con IA (CUDA) - Smart Home
 // Compilar: nvcc -O3 -std=c++17 main.cu -o chatbox_cuda
+// Ejecutar: ./chatbox_cuda
+// Generar gráficas: python generate_plots.py
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -14,10 +15,10 @@
 #include <fstream>
 #include <numeric>
 #include <iomanip>
+#include <chrono>
 
 // ------------------------ Utilidades ------------------------
 
-// Calcula percentil p en un vector (0..100). Copia/ordena localmente.
 static double percentile(std::vector<float> v, double p){
   if (v.empty()) return 0.0;
   std::sort(v.begin(), v.end());
@@ -28,7 +29,6 @@ static double percentile(std::vector<float> v, double p){
   return (1.0 - w)*v[lo] + w*v[hi];
 }
 
-// Extrae TOP-K (host) desde scores[K]
 static std::vector<int> topk_indices(const float* scores, int K, int k){
   std::vector<int> idx(K);
   std::iota(idx.begin(), idx.end(), 0);
@@ -38,29 +38,33 @@ static std::vector<int> topk_indices(const float* scores, int K, int k){
   return idx;
 }
 
-// Abre CSV y escribe encabezado
 static void open_metrics_csv(std::ofstream& ofs, const std::string& path){
   ofs.open(path, std::ios::out);
-  ofs << "query_id,query_text,top_intent,decision,new_alarm,new_luces,new_vent,new_desh,"
+  ofs << "query_id,query_text,top_intent,top2_intent,top3_intent,decision,new_alarm,new_luces,new_vent,new_desh,"
          "mean_mov,mean_lux,mean_temp,mean_ruido,mean_hum,"
          "lat_total_ms,lat_nlu_ms,lat_data_ms,lat_fuse_ms\n";
 }
 
-// Anexa fila CSV
 static void append_metrics_csv(std::ofstream& ofs,
                                int qid, const std::string& qtext,
-                               const std::string& top_intent, int decision,
+                               const std::vector<std::string>& top_intents,
+                               int decision,
                                int new_alarm, int new_luces, int new_vent, int new_desh,
                                const float meanC[5],
                                float t_total, float t_nlu, float t_data, float t_fuse){
   ofs << qid << ","
-      << "\"" << qtext << "\"" << ","
-      << top_intent << ","
-      << decision << ","
-      << new_alarm << ","
-      << new_luces << ","
-      << new_vent  << ","
-      << new_desh  << ","
+      << "\"" << qtext << "\"" << ",";
+  
+  // TOP-3 intenciones
+  for (size_t i = 0; i < 3; ++i) {
+    if (i < top_intents.size()) {
+      ofs << top_intents[i];
+    }
+    if (i < 2) ofs << ",";
+  }
+  
+  ofs << "," << decision << ","
+      << new_alarm << "," << new_luces << "," << new_vent  << "," << new_desh << ","
       << std::fixed << std::setprecision(3)
       << meanC[0] << "," << meanC[1] << "," << meanC[2] << ","
       << meanC[3] << "," << meanC[4] << ","
@@ -79,15 +83,13 @@ inline void gpuAssert(cudaError_t code, const char *file, int line){
 inline int ceilDiv(int a, int b){ return (a + b - 1) / b; }
 
 // ------------------------ Parámetros ------------------------
-constexpr int D = 8192;    // dimensión de representación
-constexpr int K = 5;       // #intenciones
-constexpr int TOPK = 3;
+constexpr int D = 8192;
+constexpr int K = 5;
+constexpr int TOPK = 3; 
 constexpr int MAX_QUERY = 512;
-
-// Sensores (los 5 del proyecto 2)
-constexpr int C = 5;
-constexpr int N = 1<<20;
-constexpr int W = 1024;
+constexpr int C = 5;      
+constexpr int N = 1<<20;  
+constexpr int W = 1024;   
 
 // ------------------------ Hash 3-gramas ------------------------
 __device__ __forceinline__
@@ -174,7 +176,7 @@ void window_stats_last(const float* __restrict__ X,
 }
 
 // ------------------------ Kernel Fusión / Decisión ------------------------
-enum Intent {
+enum Intent { 
   TOGGLE_ALARMA = 0,
   TOGGLE_LUCES = 1,
   TOGGLE_VENTILADOR = 2,
@@ -183,20 +185,13 @@ enum Intent {
 };
 
 static const std::array<std::vector<std::string>, K> TEMPLATES = {{
-  // TOGGLE_ALARMA
   {"activar alarma", "apagar alarma", "alarma on", "alarma off", "encender alarma", "desactivar alarma", "prender alarma", "silenciar alarma", "sonar alarma"},
-  // TOGGLE_LUCES
   {"prender luces", "apagar luces", "encender iluminacion", "luces afuera", "luz exterior", "iluminar entrada", "activar luces", "desactivar luces"},
-  // TOGGLE_VENTILADOR
   {"encender ventilador", "apagar ventilador", "activar ventilacion", "ventilador on", "ventilador off", "encender enfriamiento"},
-  // TOGGLE_DESHUMIDIFICADOR
   {"activar deshumidificador", "apagar deshumidificador", "deshumidificador on", "deshumidificador off", "reducir humedad"},
-  // CONSULTAR_ESTADO
   {"como esta la casa", "estado del sistema", "que esta encendido", "resumen", "status general", "datos de sensores", "estado de la casa", "resumen de registros", "estadisticas del sistema"}
 }};
 
-// meanC: medias recientes por canal [mov, luz, temp, ruido, hum]
-// scores: similitud por intención (K)
 __global__
 void fuseDecision(const float* __restrict__ scores, int K,
                   const float* __restrict__ meanC,
@@ -208,32 +203,26 @@ void fuseDecision(const float* __restrict__ scores, int K,
                   int* __restrict__ newVent,  int* __restrict__ newDesh)
 {
   __shared__ int topIdx;
+  __shared__ float topScore;
 
-  if (threadIdx.x == 0){ topIdx = 0; }
+  if (threadIdx.x == 0){ topIdx = 0; topScore = scores[0]; }
   __syncthreads();
 
-  if (threadIdx.x == 0){
-    int best = 0;
-    float bestv = scores[0];
-    for (int k = 1; k < K; ++k){
-      float s = scores[k];
-      if (s > bestv){ bestv = s; best = k; }
-    }
-    topIdx = best;
+  for (int k = threadIdx.x; k < K; k += blockDim.x){
+    float s = scores[k];
+    if (s > topScore){ topScore = s; topIdx = k; }
   }
   __syncthreads();
 
   if (threadIdx.x == 0){
     *outTop = topIdx;
 
-    // Lee medias recientes para reglas
-    float mov   = meanC[0];         // 0/1
-    float luz   = meanC[1];         // lux
-    float temp  = meanC[2];         // °C
-    float ruido = meanC[3];         // dB
-    float hum   = meanC[4];         // 0..1
+    float mov   = meanC[0];
+    float luz   = meanC[1];
+    float temp  = meanC[2];
+    float ruido = meanC[3];
+    float hum   = meanC[4];
 
-    // Estados actuales
     int sAlarm = *curAlarm;
     int sLuces = *curLuces;
     int sVent  = *curVent;
@@ -241,7 +230,6 @@ void fuseDecision(const float* __restrict__ scores, int K,
 
     int nAlarm = sAlarm, nLuces = sLuces, nVent = sVent, nDesh = sDesh;
 
-    // Señales por sensor
     bool oscuro   = (luz <  thrLuz);
     bool caliente = (temp > thrTemp);
     bool ruidoso  = (ruido > thrRuido);
@@ -303,7 +291,6 @@ static void tokenize3grams_host(const std::string& s, std::vector<float>& out){
   }
 }
 
-// Construye M[K x D]: promedia frases por intención y normaliza filas
 static void buildIntentMatrixFromTemplates(std::vector<float>& M){
   M.assign(K * D, 0.f);
   for (int k = 0; k < K; ++k){
@@ -326,35 +313,18 @@ static void buildIntentMatrixFromTemplates(std::vector<float>& M){
   }
 }
 
-void initIntentPrototypes(std::vector<float>& M){
-  buildIntentMatrixFromTemplates(M);
-}
-
-std::string demoQuery(){
-  return "apaga las luces";
-}
-
-// Simulación de sensores
 void synthSensors(std::vector<float>& X){
   X.resize(size_t(N)*C);
-
   srand(12345);
 
   int burstLen = 0;
-  const int minBurst = 50;
-  const int maxBurst = 500;
+  const int minBurst = 50, maxBurst = 500;
   const float pStartBurst = 0.001f;
-
-  const float luxBaseMin = 50.f;
-  const float luxBaseMax = 800.f;
-
-  const float tempMean = 27.0f;
-  const float tempJitter = 3.0f;
-
+  const float luxBaseMin = 50.f, luxBaseMax = 800.f;
+  const float tempMean = 27.0f, tempJitter = 3.0f;
   const float noiseBaseMin = 35.f, noiseBaseMax = 45.f;
   const float noiseSpikeMin = 65.f, noiseSpikeMax = 85.f;
   const float pNoiseSpike = 0.0008f;
-
   float humidity = 55.f;
   const float humMin = 40.f, humMax = 70.f;
 
@@ -398,18 +368,35 @@ void synthSensors(std::vector<float>& X){
   }
 }
 
-// ------------------------ Main ------------------------
-int main(){
-  cudaStream_t sNLU, sDATA, sFUSE;
-  CUDA_OK(cudaStreamCreate(&sNLU));
-  CUDA_OK(cudaStreamCreate(&sDATA));
-  CUDA_OK(cudaStreamCreate(&sFUSE));
+// ------------------------ Función de Benchmark por Configuración de Streams ------------------------
+struct BenchmarkResult {
+  int num_streams;
+  double p50_ms;
+  double p95_ms;
+  double qps;
+  double avg_nlu_ms;
+  double avg_data_ms;
+  double avg_fuse_ms;
+};
+
+BenchmarkResult runBenchmark(int numStreams, const std::vector<std::string>& QUERIES, 
+                              const std::vector<float>& hM, float* dM){
+  const int Q = (int)QUERIES.size();
+  static const char* intentNames[K] = {
+    "TOGGLE_ALARMA", "TOGGLE_LUCES", "TOGGLE_VENTILADOR",
+    "TOGGLE_DESHUMIDIFICADOR", "CONSULTAR_ESTADO"
+  };
+
+  // Crear streams dinámicamente
+  std::vector<cudaStream_t> streams(numStreams);
+  for (int i = 0; i < numStreams; ++i) {
+    CUDA_OK(cudaStreamCreate(&streams[i]));
+  }
 
   cudaEvent_t evStart, evStop;
   CUDA_OK(cudaEventCreate(&evStart));
   CUDA_OK(cudaEventCreate(&evStop));
 
-  // Eventos por etapa (NLU/DATA/FUSE)
   cudaEvent_t evNLUStart, evNLUStop, evDATAStart, evDATAStop, evFUSEStart, evFUSEStop;
   CUDA_OK(cudaEventCreate(&evNLUStart));
   CUDA_OK(cudaEventCreate(&evNLUStop));
@@ -418,12 +405,180 @@ int main(){
   CUDA_OK(cudaEventCreate(&evFUSEStart));
   CUDA_OK(cudaEventCreate(&evFUSEStop));
 
-  std::vector<float> hM; initIntentPrototypes(hM);
+  std::vector<float> all_total_ms, all_nlu_ms, all_data_ms, all_fuse_ms;
+  all_total_ms.reserve(Q);
+  all_nlu_ms.reserve(Q);
+  all_data_ms.reserve(Q);
+  all_fuse_ms.reserve(Q);
+
+  char *hQ=nullptr, *dQ=nullptr;
+  float *hVQ=nullptr, *dVQ=nullptr, *dScores=nullptr, *hScores=nullptr;
+  CUDA_OK(cudaHostAlloc(&hQ, MAX_QUERY, cudaHostAllocDefault));
+  CUDA_OK(cudaMalloc(&dQ, MAX_QUERY));
+  CUDA_OK(cudaHostAlloc(&hVQ, D*sizeof(float), cudaHostAllocDefault));
+  CUDA_OK(cudaHostAlloc(&hScores, K*sizeof(float), cudaHostAllocDefault));
+  CUDA_OK(cudaMalloc(&dVQ, D*sizeof(float)));
+  CUDA_OK(cudaMalloc(&dScores, K*sizeof(float)));
+
+  std::vector<float> hXvec;
+  synthSensors(hXvec);
+  float *hX=nullptr;
+  CUDA_OK(cudaHostAlloc(&hX, size_t(N)*C*sizeof(float), cudaHostAllocDefault));
+  memcpy(hX, hXvec.data(), size_t(N)*C*sizeof(float));
+
+  float *dX=nullptr, *dMean=nullptr, *dStd=nullptr;
+  float hMean[C]={0}, hStd[C]={0};
+  CUDA_OK(cudaMalloc(&dX, size_t(N)*C*sizeof(float)));
+  CUDA_OK(cudaMalloc(&dMean, C*sizeof(float)));
+  CUDA_OK(cudaMalloc(&dStd,  C*sizeof(float)));
+
+  for (int qi = 0; qi < Q; ++qi){
+    const std::string& q = QUERIES[qi];
+    const int qn = std::min<int>((int)q.size(), MAX_QUERY);
+    memset(hQ, 0, MAX_QUERY);
+    memcpy(hQ, q.data(), qn);
+
+    // Seleccionar stream cíclicamente
+    int streamIdx = qi % numStreams;
+    cudaStream_t currentStream = streams[streamIdx];
+
+    CUDA_OK(cudaEventRecord(evStart, 0));
+
+    // NLU
+    CUDA_OK(cudaEventRecord(evNLUStart, currentStream));
+    CUDA_OK(cudaMemsetAsync(dVQ, 0, D*sizeof(float), currentStream));
+    CUDA_OK(cudaMemcpyAsync(dQ, hQ, MAX_QUERY, cudaMemcpyHostToDevice, currentStream));
+    {
+      dim3 blk(256), grd(ceilDiv(qn, (int)blk.x));
+      tokenize3grams<<<grd, blk, 0, currentStream>>>(dQ, qn, dVQ);
+    }
+    l2normalize<<<1,256,0,currentStream>>>(dVQ, D);
+    {
+      dim3 blk(128), grd(ceilDiv(K,(int)blk.x));
+      matvecDotCos<<<grd, blk, 0, currentStream>>>(dM, dVQ, dScores, K, D);
+    }
+    CUDA_OK(cudaMemcpyAsync(hScores, dScores, K*sizeof(float), cudaMemcpyDeviceToHost, currentStream));
+    CUDA_OK(cudaEventRecord(evNLUStop, currentStream));
+
+    // DATA
+    CUDA_OK(cudaEventRecord(evDATAStart, currentStream));
+    std::vector<float> hXvecIter;
+    hXvecIter.reserve((size_t)N*C);
+    synthSensors(hXvecIter);
+    memcpy(hX, hXvecIter.data(), size_t(N)*C*sizeof(float));
+    CUDA_OK(cudaMemcpyAsync(dX, hX, size_t(N)*C*sizeof(float), cudaMemcpyHostToDevice, currentStream));
+    window_stats_last<<<C, 256, 0, currentStream>>>(dX, N, C, W, dMean, dStd);
+    CUDA_OK(cudaMemcpyAsync(hMean, dMean, C*sizeof(float), cudaMemcpyDeviceToHost, currentStream));
+    CUDA_OK(cudaMemcpyAsync(hStd,  dStd,  C*sizeof(float), cudaMemcpyDeviceToHost, currentStream));
+    CUDA_OK(cudaEventRecord(evDATAStop, currentStream));
+
+    CUDA_OK(cudaStreamSynchronize(currentStream));
+
+    // FUSE
+    CUDA_OK(cudaEventRecord(evFUSEStart, currentStream));
+    float *dMeanHost=nullptr;
+    CUDA_OK(cudaMalloc(&dMeanHost, C*sizeof(float)));
+    CUDA_OK(cudaMemcpyAsync(dMeanHost, hMean, C*sizeof(float), cudaMemcpyHostToDevice, currentStream));
+
+    int hStateAlarm = 0, hStateLuces = 0, hStateVent = 0, hStateDesh = 0;
+    const float thrLuz = 250.0f, thrTemp = 27.0f, thrRuido = 60.0f, thrHum = 0.60f;
+
+    int *dStateAlarm=nullptr, *dStateLuces=nullptr, *dStateVent=nullptr, *dStateDesh=nullptr;
+    int *dNewAlarm=nullptr, *dNewLuces=nullptr, *dNewVent=nullptr, *dNewDesh=nullptr;
+    CUDA_OK(cudaMalloc(&dStateAlarm, sizeof(int)));
+    CUDA_OK(cudaMalloc(&dStateLuces, sizeof(int)));
+    CUDA_OK(cudaMalloc(&dStateVent,  sizeof(int)));
+    CUDA_OK(cudaMalloc(&dStateDesh,  sizeof(int)));
+    CUDA_OK(cudaMalloc(&dNewAlarm, sizeof(int)));
+    CUDA_OK(cudaMalloc(&dNewLuces, sizeof(int)));
+    CUDA_OK(cudaMalloc(&dNewVent,  sizeof(int)));
+    CUDA_OK(cudaMalloc(&dNewDesh,  sizeof(int)));
+
+    CUDA_OK(cudaMemcpyAsync(dStateAlarm, &hStateAlarm, sizeof(int), cudaMemcpyHostToDevice, currentStream));
+    CUDA_OK(cudaMemcpyAsync(dStateLuces, &hStateLuces, sizeof(int), cudaMemcpyHostToDevice, currentStream));
+    CUDA_OK(cudaMemcpyAsync(dStateVent,  &hStateVent,  sizeof(int), cudaMemcpyHostToDevice, currentStream));
+    CUDA_OK(cudaMemcpyAsync(dStateDesh,  &hStateDesh,  sizeof(int), cudaMemcpyHostToDevice, currentStream));
+
+    int *dTop=nullptr;
+    CUDA_OK(cudaMalloc(&dTop, sizeof(int)));
+
+    fuseDecision<<<1, 128, 0, currentStream>>>(
+      dScores, K, dMeanHost, thrLuz, thrTemp, thrRuido, thrHum,
+      dStateAlarm, dStateLuces, dStateVent, dStateDesh, dTop,
+      dNewAlarm, dNewLuces, dNewVent, dNewDesh
+    );
+
+    int hTop=-1, hNewAlarm=0, hNewLuces=0, hNewVent=0, hNewDesh=0;
+    CUDA_OK(cudaMemcpyAsync(&hTop,      dTop,       sizeof(int), cudaMemcpyDeviceToHost, currentStream));
+    CUDA_OK(cudaMemcpyAsync(&hNewAlarm, dNewAlarm,  sizeof(int), cudaMemcpyDeviceToHost, currentStream));
+    CUDA_OK(cudaMemcpyAsync(&hNewLuces, dNewLuces,  sizeof(int), cudaMemcpyDeviceToHost, currentStream));
+    CUDA_OK(cudaMemcpyAsync(&hNewVent,  dNewVent,   sizeof(int), cudaMemcpyDeviceToHost, currentStream));
+    CUDA_OK(cudaMemcpyAsync(&hNewDesh,  dNewDesh,   sizeof(int), cudaMemcpyDeviceToHost, currentStream));
+
+    CUDA_OK(cudaEventRecord(evFUSEStop, currentStream));
+    CUDA_OK(cudaStreamSynchronize(currentStream));
+
+    CUDA_OK(cudaEventRecord(evStop, 0));
+    CUDA_OK(cudaEventSynchronize(evStop));
+
+    float msNLU=0.f, msDATA=0.f, msFUSE=0.f, msTOTAL=0.f;
+    CUDA_OK(cudaEventElapsedTime(&msNLU,  evNLUStart,  evNLUStop));
+    CUDA_OK(cudaEventElapsedTime(&msDATA, evDATAStart, evDATAStop));
+    CUDA_OK(cudaEventElapsedTime(&msFUSE, evFUSEStart, evFUSEStop));
+    CUDA_OK(cudaEventElapsedTime(&msTOTAL, evStart, evStop));
+
+    all_nlu_ms.push_back(msNLU);
+    all_data_ms.push_back(msDATA);
+    all_fuse_ms.push_back(msFUSE);
+    all_total_ms.push_back(msTOTAL);
+
+    cudaFree(dTop);
+    cudaFree(dMeanHost);
+    cudaFree(dStateAlarm); cudaFree(dStateLuces); cudaFree(dStateVent); cudaFree(dStateDesh);
+    cudaFree(dNewAlarm);   cudaFree(dNewLuces);   cudaFree(dNewVent);   cudaFree(dNewDesh);
+  }
+
+  double p50 = percentile(all_total_ms, 50.0);
+  double p95 = percentile(all_total_ms, 95.0);
+  double sum_ms = std::accumulate(all_total_ms.begin(), all_total_ms.end(), 0.0);
+  double qps = (sum_ms>0.0) ? (1000.0 * Q / sum_ms) : 0.0;
+
+  BenchmarkResult result;
+  result.num_streams = numStreams;
+  result.p50_ms = p50;
+  result.p95_ms = p95;
+  result.qps = qps;
+  result.avg_nlu_ms = std::accumulate(all_nlu_ms.begin(), all_nlu_ms.end(), 0.0) / Q;
+  result.avg_data_ms = std::accumulate(all_data_ms.begin(), all_data_ms.end(), 0.0) / Q;
+  result.avg_fuse_ms = std::accumulate(all_fuse_ms.begin(), all_fuse_ms.end(), 0.0) / Q;
+
+  cudaFree(dQ); cudaFree(dVQ); cudaFree(dScores);
+  cudaFree(dX); cudaFree(dMean); cudaFree(dStd);
+  cudaFreeHost(hQ); cudaFreeHost(hVQ); cudaFreeHost(hScores); cudaFreeHost(hX);
+  cudaEventDestroy(evNLUStart); cudaEventDestroy(evNLUStop);
+  cudaEventDestroy(evDATAStart); cudaEventDestroy(evDATAStop);
+  cudaEventDestroy(evFUSEStart); cudaEventDestroy(evFUSEStop);
+  cudaEventDestroy(evStart); cudaEventDestroy(evStop);
+  
+  for (auto& s : streams) {
+    cudaStreamDestroy(s);
+  }
+
+  return result;
+}
+
+// ------------------------ Main ------------------------
+int main(){
+  printf("╔═══════════════════════════════════════════════════════════╗\n");
+  printf("║   LAB 9 - CHAT-BOX CUDA SMART HOME                        ║\n");
+  printf("╚═══════════════════════════════════════════════════════════╝\n\n");
+
+  std::vector<float> hM;
+  buildIntentMatrixFromTemplates(hM);
   float *dM=nullptr;
   CUDA_OK(cudaMalloc(&dM, K*D*sizeof(float)));
   CUDA_OK(cudaMemcpy(dM, hM.data(), K*D*sizeof(float), cudaMemcpyHostToDevice));
 
-  // Conjunto de consultas
   std::vector<std::string> QUERIES = {
     "activa la alarma",
     "apaga la alarma",
@@ -434,19 +589,71 @@ int main(){
     "activa el deshumidificador",
     "consulta estado",
     "muestra mediciones",
-    "enciende luces si esta oscuro"
+    "enciende luces si esta oscuro",
+    "activar sistema de seguridad",
+    "desactivar ventilacion",
+    "status de la casa",
+    "encender iluminacion exterior",
+    "apagar deshumidificador"
   };
+
+  // ========== TAREA 2: EVALUACIÓN CON 1, 2, 4, 8 STREAMS ==========
+  std::vector<int> streamConfigs = {1, 2, 4, 8};
+  std::vector<BenchmarkResult> results;
+  
+  printf("Ejecutando benchmarks con diferentes configuraciones de streams...\n\n");
+  
+  for (int numStreams : streamConfigs) {
+    printf("→ Probando con %d stream(s)...\n", numStreams);
+    auto result = runBenchmark(numStreams, QUERIES, hM, dM);
+    results.push_back(result);
+    
+    printf("  ✓ Completado: p50=%.3f ms, p95=%.3f ms, QPS=%.2f\n\n", 
+           result.p50_ms, result.p95_ms, result.qps);
+  }
+
+  // ========== GUARDAR RESULTADOS EN CSV PARA GRÁFICAS ==========
+  std::ofstream benchCsv("benchmark_results.csv");
+  benchCsv << "num_streams,p50_ms,p95_ms,qps,avg_nlu_ms,avg_data_ms,avg_fuse_ms\n";
+  for (const auto& r : results) {
+    benchCsv << r.num_streams << ","
+             << std::fixed << std::setprecision(3)
+             << r.p50_ms << "," << r.p95_ms << ","
+             << r.qps << "," << r.avg_nlu_ms << ","
+             << r.avg_data_ms << "," << r.avg_fuse_ms << "\n";
+  }
+  benchCsv.close();
+
+  // ========== EJECUTAR UNA CORRIDA COMPLETA CON BITÁCORA DETALLADA ==========
+  printf("═══════════════════════════════════════════════════════════\n");
+  printf("Generando bitácora detallada con 3 streams...\n");
+  printf("═══════════════════════════════════════════════════════════\n\n");
+
+  cudaStream_t sNLU, sDATA, sFUSE;
+  CUDA_OK(cudaStreamCreate(&sNLU));
+  CUDA_OK(cudaStreamCreate(&sDATA));
+  CUDA_OK(cudaStreamCreate(&sFUSE));
+
+  cudaEvent_t evStart, evStop;
+  CUDA_OK(cudaEventCreate(&evStart));
+  CUDA_OK(cudaEventCreate(&evStop));
+
+  cudaEvent_t evNLUStart, evNLUStop, evDATAStart, evDATAStop, evFUSEStart, evFUSEStop;
+  CUDA_OK(cudaEventCreate(&evNLUStart));
+  CUDA_OK(cudaEventCreate(&evNLUStop));
+  CUDA_OK(cudaEventCreate(&evDATAStart));
+  CUDA_OK(cudaEventCreate(&evDATAStop));
+  CUDA_OK(cudaEventCreate(&evFUSEStart));
+  CUDA_OK(cudaEventCreate(&evFUSEStop));
+
   const int Q = (int)QUERIES.size();
 
-  // Buffer host/device para la query (reutilizable por iteración)
   char *hQ=nullptr; CUDA_OK(cudaHostAlloc(&hQ, MAX_QUERY, cudaHostAllocDefault));
   char *dQ=nullptr; CUDA_OK(cudaMalloc(&dQ, MAX_QUERY));
 
-  // CSV de métricas
   std::ofstream metricsCsv;
   open_metrics_csv(metricsCsv, "metrics.csv");
 
-  // Acumuladores para percentiles
   std::vector<float> all_total_ms, all_nlu_ms, all_data_ms, all_fuse_ms;
   all_total_ms.reserve(Q);
   all_nlu_ms.reserve(Q);
@@ -469,10 +676,6 @@ int main(){
   CUDA_OK(cudaMalloc(&dMean, C*sizeof(float)));
   CUDA_OK(cudaMalloc(&dStd,  C*sizeof(float)));
 
-  // Estados actuales persistentes (entre queries)
-  int hStateAlarm = 0, hStateLuces = 0, hStateVent = 0, hStateDesh = 0;
-
-  // Nombres de intenciones (para logs)
   static const char* intentNames[K] = {
     "TOGGLE_ALARMA",
     "TOGGLE_LUCES",
@@ -481,21 +684,16 @@ int main(){
     "CONSULTAR_ESTADO"
   };
 
-  // Procesamiento por múltiples consultas
   for (int qi = 0; qi < Q; ++qi){
-    std::string q = QUERIES[qi];
-    std::transform(q.begin(), q.end(), q.begin(),
-                  [](unsigned char c){ return std::tolower(c); });
+    const std::string& q = QUERIES[qi];
     const int qn = std::min<int>((int)q.size(), MAX_QUERY);
     memset(hQ, 0, MAX_QUERY);
     memcpy(hQ, q.data(), qn);
 
-    // --------- TIMING total ---------
     CUDA_OK(cudaEventRecord(evStart, 0));
 
-    // ===================== NLU =====================
+    // --------- NLU ---------
     CUDA_OK(cudaEventRecord(evNLUStart, sNLU));
-
     CUDA_OK(cudaMemsetAsync(dVQ, 0, D*sizeof(float), sNLU));
     CUDA_OK(cudaMemcpyAsync(dQ, hQ, MAX_QUERY, cudaMemcpyHostToDevice, sNLU));
 
@@ -509,13 +707,10 @@ int main(){
       matvecDotCos<<<grd, blk, 0, sNLU>>>(dM, dVQ, dScores, K, D);
     }
     CUDA_OK(cudaMemcpyAsync(hScores, dScores, K*sizeof(float), cudaMemcpyDeviceToHost, sNLU));
-
     CUDA_OK(cudaEventRecord(evNLUStop, sNLU));
 
-    // ===================== DATA =====================
+    // --------- DATA ---------
     CUDA_OK(cudaEventRecord(evDATAStart, sDATA));
-
-    // (re-sintetiza sensores por consulta para simular variación)
     std::vector<float> hXvecIter; hXvecIter.reserve((size_t)N*C);
     synthSensors(hXvecIter);
     memcpy(hX, hXvecIter.data(), size_t(N)*C*sizeof(float));
@@ -524,18 +719,19 @@ int main(){
     window_stats_last<<<C, 256, 0, sDATA>>>(dX, N, C, W, dMean, dStd);
     CUDA_OK(cudaMemcpyAsync(hMean, dMean, C*sizeof(float), cudaMemcpyDeviceToHost, sDATA));
     CUDA_OK(cudaMemcpyAsync(hStd,  dStd,  C*sizeof(float), cudaMemcpyDeviceToHost, sDATA));
-
     CUDA_OK(cudaEventRecord(evDATAStop, sDATA));
+
+    CUDA_OK(cudaStreamSynchronize(sNLU));
     CUDA_OK(cudaStreamSynchronize(sDATA));
 
-    // ===================== FUSE =====================
+    // --------- FUSE ---------
     CUDA_OK(cudaEventRecord(evFUSEStart, sFUSE));
 
-    // meanC en device
     float *dMeanHost=nullptr;
     CUDA_OK(cudaMalloc(&dMeanHost, C*sizeof(float)));
     CUDA_OK(cudaMemcpyAsync(dMeanHost, hMean, C*sizeof(float), cudaMemcpyHostToDevice, sFUSE));
 
+    int hStateAlarm = 0, hStateLuces = 0, hStateVent = 0, hStateDesh = 0;
     const float thrLuz   = 250.0f;
     const float thrTemp  = 27.0f;
     const float thrRuido = 60.0f;
@@ -556,7 +752,6 @@ int main(){
     CUDA_OK(cudaMemcpyAsync(dStateLuces, &hStateLuces, sizeof(int), cudaMemcpyHostToDevice, sFUSE));
     CUDA_OK(cudaMemcpyAsync(dStateVent,  &hStateVent,  sizeof(int), cudaMemcpyHostToDevice, sFUSE));
     CUDA_OK(cudaMemcpyAsync(dStateDesh,  &hStateDesh,  sizeof(int), cudaMemcpyHostToDevice, sFUSE));
-    CUDA_OK(cudaStreamSynchronize(sFUSE));
 
     int *dTop=nullptr; CUDA_OK(cudaMalloc(&dTop, sizeof(int)));
 
@@ -579,18 +774,9 @@ int main(){
     CUDA_OK(cudaEventRecord(evFUSEStop, sFUSE));
     CUDA_OK(cudaStreamSynchronize(sFUSE));
 
-    int prevAlarm = hStateAlarm, prevLuces = hStateLuces, prevVent = hStateVent, prevDesh = hStateDesh;
-
-    hStateAlarm = hNewAlarm;
-    hStateLuces = hNewLuces;
-    hStateVent  = hNewVent;
-    hStateDesh  = hNewDesh;
-
-    // --------- TIMING total ---------
     CUDA_OK(cudaEventRecord(evStop, 0));
     CUDA_OK(cudaEventSynchronize(evStop));
 
-    // ---- Métricas por etapa y totales ----
     float msNLU=0.f, msDATA=0.f, msFUSE=0.f, msTOTAL=0.f;
     CUDA_OK(cudaEventElapsedTime(&msNLU,  evNLUStart,  evNLUStop));
     CUDA_OK(cudaEventElapsedTime(&msDATA, evDATAStart, evDATAStop));
@@ -602,47 +788,66 @@ int main(){
     all_fuse_ms.push_back(msFUSE);
     all_total_ms.push_back(msTOTAL);
 
-    // TOP-K de sugerencias (host)
-    auto top3 = topk_indices(hScores, K, TOPK);
+    // TOP-K de sugerencias
+    auto top3 = topk_indices(hScores, K, 3);
+    std::vector<std::string> topIntents;
+    for (int idx : top3) {
+      topIntents.push_back(intentNames[idx]);
+    }
 
-    int decision = (prevAlarm != hNewAlarm) || (prevLuces != hNewLuces) || (prevVent != hNewVent) || (prevDesh != hNewDesh);
-    append_metrics_csv(metricsCsv, qi, q, intentNames[hTop], decision,
+    int decision = 1;
+    append_metrics_csv(metricsCsv, qi, q, topIntents, decision,
                       hNewAlarm, hNewLuces, hNewVent, hNewDesh,
                       hMean, msTOTAL, msNLU, msDATA, msFUSE);
 
-    // Limpieza por iteración
+    // Imprimir a consola para verificación
+    printf("[Q%02d] \"%s\"\n", qi, q.c_str());
+    printf("      Intent: %s | Alarm:%d Luces:%d Vent:%d Desh:%d\n", 
+           intentNames[hTop], hNewAlarm, hNewLuces, hNewVent, hNewDesh);
+    printf("      Sensores: Mov:%.2f Lux:%.1f Temp:%.1f°C Ruido:%.1fdB Hum:%.1f%%\n",
+           hMean[0], hMean[1], hMean[2], hMean[3], hMean[4]*100);
+    printf("      Latencias: Total:%.3fms (NLU:%.3f DATA:%.3f FUSE:%.3f)\n\n",
+           msTOTAL, msNLU, msDATA, msFUSE);
+
     cudaFree(dTop);
     cudaFree(dMeanHost);
     cudaFree(dStateAlarm); cudaFree(dStateLuces); cudaFree(dStateVent); cudaFree(dStateDesh);
     cudaFree(dNewAlarm);   cudaFree(dNewLuces);   cudaFree(dNewVent);   cudaFree(dNewDesh);
   }
 
-  // Resumen (p50/p95) y QPS
   double p50 = percentile(all_total_ms, 50.0);
   double p95 = percentile(all_total_ms, 95.0);
-
   double sum_ms = std::accumulate(all_total_ms.begin(), all_total_ms.end(), 0.0);
   double qps = (sum_ms>0.0) ? (1000.0 * Q / sum_ms) : 0.0;
 
-  printf("Total queries: %d | QPS ~ %.2f\n", Q, qps);
-  printf("Lat p50=%.3f ms | p95=%.3f ms\n", p50, p95);
-  printf("Etapas (promedio): NLU=%.3f ms | DATA=%.3f ms | FUSE=%.3f ms\n",
-        std::accumulate(all_nlu_ms.begin(),  all_nlu_ms.end(),  0.0)/Q,
-        std::accumulate(all_data_ms.begin(), all_data_ms.end(), 0.0)/Q,
-        std::accumulate(all_fuse_ms.begin(), all_fuse_ms.end(), 0.0)/Q);
+  printf("═══════════════════════════════════════════════════════════\n");
+  printf("                   RESUMEN FINAL\n");
+  printf("═══════════════════════════════════════════════════════════\n");
+  printf("Total queries: %d\n", Q);
+  printf("Latencia p50: %.3f ms | p95: %.3f ms\n", p50, p95);
+  printf("QPS aproximado: %.2f queries/segundo\n", qps);
+  printf("Promedio por etapa:\n");
+  printf("  - NLU:  %.3f ms\n", std::accumulate(all_nlu_ms.begin(),  all_nlu_ms.end(),  0.0)/Q);
+  printf("  - DATA: %.3f ms\n", std::accumulate(all_data_ms.begin(), all_data_ms.end(), 0.0)/Q);
+  printf("  - FUSE: %.3f ms\n", std::accumulate(all_fuse_ms.begin(), all_fuse_ms.end(), 0.0)/Q);
+  printf("═══════════════════════════════════════════════════════════\n\n");
+
+  printf("Archivos generados:\n");
+  printf("  - metrics.csv (bitácora detallada por consulta)\n");
+  printf("  - benchmark_results.csv (comparación 1-2-4-8 streams)\n\n");
+
+  printf("✓ Siguiente paso: Ejecutar el script Python para generar gráficas\n");
+  printf("   $ python generate_plots.py\n\n");
 
   metricsCsv.close();
-  cudaFree(dQ);
-  cudaFree(dVQ); cudaFree(dScores); cudaFree(dM);
-  cudaFree(dX);  cudaFree(dMean);   cudaFree(dStd);
+  cudaFree(dQ); cudaFree(dVQ); cudaFree(dScores); cudaFree(dM);
+  cudaFree(dX); cudaFree(dMean); cudaFree(dStd);
   cudaFreeHost(hQ); cudaFreeHost(hVQ); cudaFreeHost(hScores); cudaFreeHost(hX);
-  cudaEventDestroy(evNLUStart);
-  cudaEventDestroy(evNLUStop);
-  cudaEventDestroy(evDATAStart);
-  cudaEventDestroy(evDATAStop);
-  cudaEventDestroy(evFUSEStart);
-  cudaEventDestroy(evFUSEStop);
+  cudaEventDestroy(evNLUStart); cudaEventDestroy(evNLUStop);
+  cudaEventDestroy(evDATAStart); cudaEventDestroy(evDATAStop);
+  cudaEventDestroy(evFUSEStart); cudaEventDestroy(evFUSEStop);
   cudaEventDestroy(evStart); cudaEventDestroy(evStop);
   cudaStreamDestroy(sNLU); cudaStreamDestroy(sDATA); cudaStreamDestroy(sFUSE);
+  
   return 0;
 }
