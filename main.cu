@@ -81,13 +81,13 @@ inline int ceilDiv(int a, int b){ return (a + b - 1) / b; }
 // ------------------------ Parámetros ------------------------
 constexpr int D = 8192;    // dimensión de representación
 constexpr int K = 5;       // #intenciones
-constexpr int TOPK = 3; 
+constexpr int TOPK = 3;
 constexpr int MAX_QUERY = 512;
 
 // Sensores (los 5 del proyecto 2)
-constexpr int C = 5;      
-constexpr int N = 1<<20;  
-constexpr int W = 1024;   
+constexpr int C = 5;
+constexpr int N = 1<<20;
+constexpr int W = 1024;
 
 // ------------------------ Hash 3-gramas ------------------------
 __device__ __forceinline__
@@ -174,7 +174,7 @@ void window_stats_last(const float* __restrict__ X,
 }
 
 // ------------------------ Kernel Fusión / Decisión ------------------------
-enum Intent { 
+enum Intent {
   TOGGLE_ALARMA = 0,
   TOGGLE_LUCES = 1,
   TOGGLE_VENTILADOR = 2,
@@ -195,11 +195,8 @@ static const std::array<std::vector<std::string>, K> TEMPLATES = {{
   {"como esta la casa", "estado del sistema", "que esta encendido", "resumen", "status general", "datos de sensores", "estado de la casa", "resumen de registros", "estadisticas del sistema"}
 }};
 
-// Kernel Fusión / Decisión
 // meanC: medias recientes por canal [mov, luz, temp, ruido, hum]
 // scores: similitud por intención (K)
-// top intent: elección softmax-free via argmax de scores
-// Regla: combina intención + sensores (umbrales) y decide nuevos estados (toggle con prioridad de seguridad)
 __global__
 void fuseDecision(const float* __restrict__ scores, int K,
                   const float* __restrict__ meanC,
@@ -211,15 +208,18 @@ void fuseDecision(const float* __restrict__ scores, int K,
                   int* __restrict__ newVent,  int* __restrict__ newDesh)
 {
   __shared__ int topIdx;
-  __shared__ float topScore;
 
-  if (threadIdx.x == 0){ topIdx = 0; topScore = scores[0]; }
+  if (threadIdx.x == 0){ topIdx = 0; }
   __syncthreads();
 
-  // Argmax paralelo simple (demo)
-  for (int k = threadIdx.x; k < K; k += blockDim.x){
-    float s = scores[k];
-    if (s > topScore){ topScore = s; topIdx = k; }
+  if (threadIdx.x == 0){
+    int best = 0;
+    float bestv = scores[0];
+    for (int k = 1; k < K; ++k){
+      float s = scores[k];
+      if (s > bestv){ bestv = s; best = k; }
+    }
+    topIdx = best;
   }
   __syncthreads();
 
@@ -241,7 +241,7 @@ void fuseDecision(const float* __restrict__ scores, int K,
 
     int nAlarm = sAlarm, nLuces = sLuces, nVent = sVent, nDesh = sDesh;
 
-    // Señales de condición fuerte por sensor
+    // Señales por sensor
     bool oscuro   = (luz <  thrLuz);
     bool caliente = (temp > thrTemp);
     bool ruidoso  = (ruido > thrRuido);
@@ -250,36 +250,26 @@ void fuseDecision(const float* __restrict__ scores, int K,
 
     switch (topIdx){
       case TOGGLE_ALARMA:
-        // Seguridad manda: si hay movimiento o ruido alto, se enciende
         if (hayMov || ruidoso) nAlarm = 1;
-        else nAlarm = 1 - sAlarm;  // toggle
+        else nAlarm = 1 - sAlarm;
         break;
-
       case TOGGLE_LUCES:
-        // Si está oscuro, se enciende, de lo contrario toggle
         if (oscuro) nLuces = 1;
         else nLuces = 1 - sLuces;
         break;
-
       case TOGGLE_VENTILADOR:
-        // Si está caliente, se enciende, si no, toggle
         if (caliente) nVent = 1;
         else nVent = 1 - sVent;
         break;
-
       case TOGGLE_DESHUMIDIFICADOR:
-        // Si está húmedo, se enciende, si no, toggle
         if (humedo) nDesh = 1;
         else nDesh = 1 - sDesh;
         break;
-
       case CONSULTAR_ESTADO:
       default:
-        // No modifica actuadores
         break;
     }
 
-    // Entrega nuevas salidas
     *newAlarm = nAlarm;
     *newLuces = nLuces;
     *newVent  = nVent;
@@ -288,7 +278,6 @@ void fuseDecision(const float* __restrict__ scores, int K,
 }
 
 // ------------------------ Host helpers ------------------------
-// Host-side hashing & tokenization (mismo esquema que device)
 static inline uint32_t hash3_host(uint8_t a, uint8_t b, uint8_t c){
   uint32_t h = 2166136261u;
   h = (h ^ a) * 16777619u;
@@ -306,7 +295,7 @@ static void l2normalize_host(std::vector<float>& v){
 }
 
 static void tokenize3grams_host(const std::string& s, std::vector<float>& out){
-  std::string q = s; // ya en minúsculas y sin acentos para simpleza
+  std::string q = s;
   if (q.size() < 3) return;
   for (size_t i = 0; i + 2 < q.size(); ++i){
     uint32_t idx = hash3_host((uint8_t)q[i], (uint8_t)q[i+1], (uint8_t)q[i+2]);
@@ -326,16 +315,13 @@ static void buildIntentMatrixFromTemplates(std::vector<float>& M){
       l2normalize_host(v);
       for (int j = 0; j < D; ++j) row[j] += v[j];
     }
-    // promedio y normaliza
     float inv = phrases.empty() ? 1.f : (1.f / phrases.size());
     for (int j = 0; j < D; ++j) row[j] *= inv;
-    // normaliza fila
     {
       double acc=0.0; for (float x:row) acc += double(x)*double(x);
       float n = float(std::sqrt(acc) + 1e-12);
       for (float& x:row) x /= n;
     }
-    // copia a M
     for (int j = 0; j < D; ++j) M[k*D + j] = row[j];
   }
 }
@@ -352,35 +338,27 @@ std::string demoQuery(){
 void synthSensors(std::vector<float>& X){
   X.resize(size_t(N)*C);
 
-  // RNG simple determinista
   srand(12345);
 
-  // Parámetros de comportamiento
-  // Movimiento: ráfagas (duración media corta)
-  int burstLen = 0;               // Contador de ráfaga actual
+  int burstLen = 0;
   const int minBurst = 50;
   const int maxBurst = 500;
   const float pStartBurst = 0.001f;
 
-  // Luz: base diurna simple (onda lenta) + ruido
   const float luxBaseMin = 50.f;
   const float luxBaseMax = 800.f;
 
-  // Temperatura: alrededor de 24–30 °C con ruido
   const float tempMean = 27.0f;
   const float tempJitter = 3.0f;
 
-  // Ruido: base 35–45 dB con picos (eventos) 65–85 dB
   const float noiseBaseMin = 35.f, noiseBaseMax = 45.f;
   const float noiseSpikeMin = 65.f, noiseSpikeMax = 85.f;
-  const float pNoiseSpike = 0.0008f; // prob. de pico por muestra
+  const float pNoiseSpike = 0.0008f;
 
-  // Humedad: 40–70 % con deriva muy lenta + ruido
   float humidity = 55.f;
   const float humMin = 40.f, humMax = 70.f;
 
   for (int i = 0; i < N; ++i){
-    // Movimiento (0/1) con ráfagas
     int motion = 0;
     if (burstLen > 0){
       motion = 1;
@@ -394,32 +372,24 @@ void synthSensors(std::vector<float>& X){
       }
     }
 
-    // Luz (lux) variación del día + ruido
-    // Onda lenta: mapear i en [0, 2π] a velocidad muy baja
     float phase = (i % (1<<16)) * (2.f * 3.14159265f / float(1<<16));
-    float diurnal = 0.5f * (1.f + sinf(phase)); // [0..1]
+    float diurnal = 0.5f * (1.f + sinf(phase));
     float lux = luxBaseMin + diurnal * (luxBaseMax - luxBaseMin);
-    // ruido pequeño
-    lux += ((rand()%1000)/1000.f - 0.5f) * 30.f; // ±15 lux
+    lux += ((rand()%1000)/1000.f - 0.5f) * 30.f;
     if (lux < 0.f) lux = 0.f;
 
-    // Temperatura (°C)
     float temp = tempMean + ((rand()%1000)/1000.f - 0.5f) * (2.f*tempJitter);
 
-    // Ruido (dB) con picos
     float noise = noiseBaseMin + (rand()%1000)/1000.f * (noiseBaseMax - noiseBaseMin);
     float rp = (rand()%100000) / 100000.f;
     if (rp < pNoiseSpike){
-      // Pico
       noise = noiseSpikeMin + (rand()%1000)/1000.f * (noiseSpikeMax - noiseSpikeMin);
     }
 
-    // Humedad (%) con deriva lenta (pequeña caminata aleatoria)
-    humidity += ((rand()%1000)/1000.f - 0.5f) * 0.2f; // paso corto
+    humidity += ((rand()%1000)/1000.f - 0.5f) * 0.2f;
     if (humidity < humMin) humidity = humMin + 0.5f;
     if (humidity > humMax) humidity = humMax - 0.5f;
 
-    // Escribir interleaved
     X[i*C + 0] = float(motion);
     X[i*C + 1] = lux;
     X[i*C + 2] = temp;
@@ -499,17 +469,31 @@ int main(){
   CUDA_OK(cudaMalloc(&dMean, C*sizeof(float)));
   CUDA_OK(cudaMalloc(&dStd,  C*sizeof(float)));
 
+  // Estados actuales persistentes (entre queries)
+  int hStateAlarm = 0, hStateLuces = 0, hStateVent = 0, hStateDesh = 0;
+
+  // Nombres de intenciones (para logs)
+  static const char* intentNames[K] = {
+    "TOGGLE_ALARMA",
+    "TOGGLE_LUCES",
+    "TOGGLE_VENTILADOR",
+    "TOGGLE_DESHUMIDIFICADOR",
+    "CONSULTAR_ESTADO"
+  };
+
   // Procesamiento por múltiples consultas
   for (int qi = 0; qi < Q; ++qi){
-    const std::string& q = QUERIES[qi];
+    std::string q = QUERIES[qi];
+    std::transform(q.begin(), q.end(), q.begin(),
+                  [](unsigned char c){ return std::tolower(c); });
     const int qn = std::min<int>((int)q.size(), MAX_QUERY);
     memset(hQ, 0, MAX_QUERY);
     memcpy(hQ, q.data(), qn);
 
-    // Reinicia vectores/estados por consulta
+    // --------- TIMING total ---------
     CUDA_OK(cudaEventRecord(evStart, 0));
 
-    // --------- NLU (tokenize + normalize + M·vq) ---------
+    // ===================== NLU =====================
     CUDA_OK(cudaEventRecord(evNLUStart, sNLU));
 
     CUDA_OK(cudaMemsetAsync(dVQ, 0, D*sizeof(float), sNLU));
@@ -528,7 +512,7 @@ int main(){
 
     CUDA_OK(cudaEventRecord(evNLUStop, sNLU));
 
-    // --------- DATA (estadística por ventana) ---------
+    // ===================== DATA =====================
     CUDA_OK(cudaEventRecord(evDATAStart, sDATA));
 
     // (re-sintetiza sensores por consulta para simular variación)
@@ -542,12 +526,9 @@ int main(){
     CUDA_OK(cudaMemcpyAsync(hStd,  dStd,  C*sizeof(float), cudaMemcpyDeviceToHost, sDATA));
 
     CUDA_OK(cudaEventRecord(evDATAStop, sDATA));
-
-    // Espera NLU + DATA para fusionar
-    CUDA_OK(cudaStreamSynchronize(sNLU));
     CUDA_OK(cudaStreamSynchronize(sDATA));
 
-    // --------- FUSE (decisión) ---------
+    // ===================== FUSE =====================
     CUDA_OK(cudaEventRecord(evFUSEStart, sFUSE));
 
     // meanC en device
@@ -555,8 +536,6 @@ int main(){
     CUDA_OK(cudaMalloc(&dMeanHost, C*sizeof(float)));
     CUDA_OK(cudaMemcpyAsync(dMeanHost, hMean, C*sizeof(float), cudaMemcpyHostToDevice, sFUSE));
 
-    // Estados actuales simulados (entrada) y nuevos (salida)
-    int hStateAlarm = 0, hStateLuces = 0, hStateVent = 0, hStateDesh = 0;
     const float thrLuz   = 250.0f;
     const float thrTemp  = 27.0f;
     const float thrRuido = 60.0f;
@@ -577,10 +556,10 @@ int main(){
     CUDA_OK(cudaMemcpyAsync(dStateLuces, &hStateLuces, sizeof(int), cudaMemcpyHostToDevice, sFUSE));
     CUDA_OK(cudaMemcpyAsync(dStateVent,  &hStateVent,  sizeof(int), cudaMemcpyHostToDevice, sFUSE));
     CUDA_OK(cudaMemcpyAsync(dStateDesh,  &hStateDesh,  sizeof(int), cudaMemcpyHostToDevice, sFUSE));
+    CUDA_OK(cudaStreamSynchronize(sFUSE));
 
     int *dTop=nullptr; CUDA_OK(cudaMalloc(&dTop, sizeof(int)));
 
-    // NOTA: usamos tu kernel fuseDecision ya modificado en Fase C (no lo repetimos aquí).
     fuseDecision<<<1, 128, 0, sFUSE>>>(
       dScores, K,
       dMeanHost,
@@ -600,6 +579,14 @@ int main(){
     CUDA_OK(cudaEventRecord(evFUSEStop, sFUSE));
     CUDA_OK(cudaStreamSynchronize(sFUSE));
 
+    int prevAlarm = hStateAlarm, prevLuces = hStateLuces, prevVent = hStateVent, prevDesh = hStateDesh;
+
+    hStateAlarm = hNewAlarm;
+    hStateLuces = hNewLuces;
+    hStateVent  = hNewVent;
+    hStateDesh  = hNewDesh;
+
+    // --------- TIMING total ---------
     CUDA_OK(cudaEventRecord(evStop, 0));
     CUDA_OK(cudaEventSynchronize(evStop));
 
@@ -616,17 +603,9 @@ int main(){
     all_total_ms.push_back(msTOTAL);
 
     // TOP-K de sugerencias (host)
-    auto top3 = topk_indices(hScores, K, 3);
-    static const char* intentNames[K] = {
-      "TOGGLE_ALARMA",
-      "TOGGLE_LUCES",
-      "TOGGLE_VENTILADOR",
-      "TOGGLE_DESHUMIDIFICADOR",
-      "CONSULTAR_ESTADO"
-    };
+    auto top3 = topk_indices(hScores, K, TOPK);
 
-    // Log al CSV (decision = 1 si cambió algún actuador o si tu kernel lo expone; aquí inferimos)
-    int decision = 1; // para el informe; ajusta si expones un flag explícito en fuseDecision
+    int decision = (prevAlarm != hNewAlarm) || (prevLuces != hNewLuces) || (prevVent != hNewVent) || (prevDesh != hNewDesh);
     append_metrics_csv(metricsCsv, qi, q, intentNames[hTop], decision,
                       hNewAlarm, hNewLuces, hNewVent, hNewDesh,
                       hMean, msTOTAL, msNLU, msDATA, msFUSE);
@@ -636,21 +615,15 @@ int main(){
     cudaFree(dMeanHost);
     cudaFree(dStateAlarm); cudaFree(dStateLuces); cudaFree(dStateVent); cudaFree(dStateDesh);
     cudaFree(dNewAlarm);   cudaFree(dNewLuces);   cudaFree(dNewVent);   cudaFree(dNewDesh);
-
-    // (Opcional de depuración en consola)
-    // printf("[Q%02d] intent=%s total=%.3fms (NLU=%.3f, DATA=%.3f, FUSE=%.3f)\n",
-    //        qi, intentNames[hTop], msTOTAL, msNLU, msDATA, msFUSE);
   }
 
-  // ---- Resumen (p50/p95) y QPS ----
+  // Resumen (p50/p95) y QPS
   double p50 = percentile(all_total_ms, 50.0);
   double p95 = percentile(all_total_ms, 95.0);
 
-  // “QPS” aproximado usando la suma de latencias secuenciales (demo)
   double sum_ms = std::accumulate(all_total_ms.begin(), all_total_ms.end(), 0.0);
   double qps = (sum_ms>0.0) ? (1000.0 * Q / sum_ms) : 0.0;
 
-  printf("== Resumen Fase D ==\n");
   printf("Total queries: %d | QPS ~ %.2f\n", Q, qps);
   printf("Lat p50=%.3f ms | p95=%.3f ms\n", p50, p95);
   printf("Etapas (promedio): NLU=%.3f ms | DATA=%.3f ms | FUSE=%.3f ms\n",

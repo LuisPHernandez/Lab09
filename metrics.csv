@@ -1,0 +1,11 @@
+query_id,query_text,top_intent,decision,new_alarm,new_luces,new_vent,new_desh,mean_mov,mean_lux,mean_temp,mean_ruido,mean_hum,lat_total_ms,lat_nlu_ms,lat_data_ms,lat_fuse_ms
+0,"activa la alarma",TOGGLE_ALARMA,1,1,0,0,0,0.000,406.916,27.014,40.078,41.673,120.497,0.976,119.337,0.249
+1,"apaga la alarma",TOGGLE_ALARMA,1,0,0,0,0,0.000,406.916,27.014,40.078,41.673,116.587,0.480,115.825,0.207
+2,"enciende luces exteriores",TOGGLE_LUCES,1,0,1,0,0,0.000,406.916,27.014,40.078,41.673,121.367,0.419,120.589,0.318
+3,"apaga luces",TOGGLE_LUCES,1,0,0,0,0,0.000,406.916,27.014,40.078,41.673,146.148,0.323,145.507,0.247
+4,"activa el ventilador",TOGGLE_VENTILADOR,1,0,0,1,0,0.000,406.916,27.014,40.078,41.673,140.244,0.587,139.254,0.300
+5,"apaga el ventilador",TOGGLE_VENTILADOR,0,0,0,1,0,0.000,406.916,27.014,40.078,41.673,124.002,0.341,123.389,0.209
+6,"activa el deshumidificador",TOGGLE_DESHUMIDIFICADOR,1,0,0,1,1,0.000,406.916,27.014,40.078,41.673,146.583,0.441,145.823,0.240
+7,"consulta estado",CONSULTAR_ESTADO,0,0,0,1,1,0.000,406.916,27.014,40.078,41.673,131.357,0.280,130.823,0.219
+8,"muestra mediciones",CONSULTAR_ESTADO,0,0,0,1,1,0.000,406.916,27.014,40.078,41.673,117.845,0.271,116.674,0.770
+9,"enciende luces si esta oscuro",TOGGLE_LUCES,1,0,1,1,1,0.000,406.916,27.014,40.078,41.673,118.536,0.329,117.833,0.200
