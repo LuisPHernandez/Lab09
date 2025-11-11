@@ -1,0 +1,29 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build CUDA (nvcc)",
+      "type": "shell",
+      "command": "nvcc",
+      "args": [
+        "-O3",
+        "-std=c++17",
+        "main.cu",
+        "-o",
+        "chatbox_cuda.exe"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Run chatbox_cuda",
+      "type": "shell",
+      "command": "${workspaceFolder}\\chatbox_cuda.exe",
+      "dependsOn": "Build CUDA (nvcc)",
+      "problemMatcher": []
+    }
+  ]
+}
