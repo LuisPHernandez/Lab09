@@ -1,6 +1,5 @@
-// CC3086 - Lab 9: Chat-Box con IA (CUDA)
-// Demostración: NLU ligero + Analítica sensores + Fusión, con streams y eventos.
-// Compilar: nvcc -O3 -std=c++17 main.cu -o chatbox_cuda
+//# Si usas MSYS2 o MinGW instalar libreria curl :: pacman -S mingw-w64-x86_64-curl
+// Compilar: nvcc -O3 -std=c++17 main.cu -o chatbox_cuda -lcurl
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -14,10 +13,77 @@
 #include <fstream>
 #include <numeric>
 #include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <curl/curl.h>
 
 // ------------------------ Utilidades ------------------------
 
-// Calcula percentil p en un vector (0..100). Copia/ordena localmente.
+// Callback para CURL
+static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
+    ((std::string*)userp)->append((char*)contents, size * nmemb);
+    return size * nmemb;
+}
+
+// Parser CSV simple
+std::vector<std::vector<float>> parseCSV(const std::string& csv_data) {
+    std::vector<std::vector<float>> result;
+    std::istringstream stream(csv_data);
+    std::string line;
+    
+    // Saltar encabezado
+    std::getline(stream, line);
+    
+    while (std::getline(stream, line)) {
+        if (line.empty()) continue;
+        std::vector<float> row;
+        std::istringstream lineStream(line);
+        std::string cell;
+        
+        while (std::getline(lineStream, cell, ',')) {
+            try {
+                row.push_back(std::stof(cell));
+            } catch (...) {
+                row.push_back(0.0f);
+            }
+        }
+        if (!row.empty()) result.push_back(row);
+    }
+    return result;
+}
+
+// Descarga Google Sheets como CSV
+bool downloadGoogleSheet(const std::string& sheet_url, std::vector<std::vector<float>>& data) {
+    CURL *curl;
+    CURLcode res;
+    std::string readBuffer;
+    
+    // Convertir URL de Google Sheets a formato CSV export
+    std::string csv_url = sheet_url;
+    size_t pos = csv_url.find("/edit");
+    if (pos != std::string::npos) {
+        csv_url = csv_url.substr(0, pos) + "/export?format=csv";
+    }
+    
+    curl = curl_easy_init();
+    if(curl) {
+        curl_easy_setopt(curl, CURLOPT_URL, csv_url.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        
+        res = curl_easy_perform(curl);
+        curl_easy_cleanup(curl);
+        
+        if(res == CURLE_OK) {
+            data = parseCSV(readBuffer);
+            return !data.empty();
+        }
+    }
+    return false;
+}
+
 static double percentile(std::vector<float> v, double p){
   if (v.empty()) return 0.0;
   std::sort(v.begin(), v.end());
@@ -28,7 +94,6 @@ static double percentile(std::vector<float> v, double p){
   return (1.0 - w)*v[lo] + w*v[hi];
 }
 
-// Extrae TOP-K (host) desde scores[K]
 static std::vector<int> topk_indices(const float* scores, int K, int k){
   std::vector<int> idx(K);
   std::iota(idx.begin(), idx.end(), 0);
@@ -38,7 +103,6 @@ static std::vector<int> topk_indices(const float* scores, int K, int k){
   return idx;
 }
 
-// Abre CSV y escribe encabezado
 static void open_metrics_csv(std::ofstream& ofs, const std::string& path){
   ofs.open(path, std::ios::out);
   ofs << "query_id,query_text,top_intent,decision,new_alarm,new_luces,new_vent,new_desh,"
@@ -46,7 +110,6 @@ static void open_metrics_csv(std::ofstream& ofs, const std::string& path){
          "lat_total_ms,lat_nlu_ms,lat_data_ms,lat_fuse_ms\n";
 }
 
-// Anexa fila CSV
 static void append_metrics_csv(std::ofstream& ofs,
                                int qid, const std::string& qtext,
                                const std::string& top_intent, int decision,
@@ -79,15 +142,14 @@ inline void gpuAssert(cudaError_t code, const char *file, int line){
 inline int ceilDiv(int a, int b){ return (a + b - 1) / b; }
 
 // ------------------------ Parámetros ------------------------
-constexpr int D = 8192;    // dimensión de representación
-constexpr int K = 5;       // #intenciones
+constexpr int D = 8192;
+constexpr int K = 5;
 constexpr int TOPK = 3;
 constexpr int MAX_QUERY = 512;
 
-// Sensores (los 5 del proyecto 2)
+// Sensores (5 canales)
 constexpr int C = 5;
-constexpr int N = 1<<20;
-constexpr int W = 1024;
+constexpr int W = 1024;  // Ventana de últimas muestras
 
 // ------------------------ Hash 3-gramas ------------------------
 __device__ __forceinline__
@@ -149,7 +211,9 @@ void window_stats_last(const float* __restrict__ X,
   if (c >= C) return;
   float sum = 0.f, sum2 = 0.f;
   int start = max(0, N - W);
-  for (int i = threadIdx.x; i < W; i += blockDim.x){
+  int actual_w = N - start;
+  
+  for (int i = threadIdx.x; i < actual_w; i += blockDim.x){
     float v = X[(start + i)*C + c];
     sum  += v;
     sum2 += v*v;
@@ -166,8 +230,8 @@ void window_stats_last(const float* __restrict__ X,
     __syncthreads();
   }
   if (threadIdx.x == 0){
-    float m = ssum[0] / W;
-    float var = fmaxf(ssum2[0]/W - m*m, 0.f);
+    float m = ssum[0] / actual_w;
+    float var = fmaxf(ssum2[0]/actual_w - m*m, 0.f);
     mean_out[c] = m;
     std_out[c]  = sqrtf(var);
   }
@@ -183,20 +247,13 @@ enum Intent {
 };
 
 static const std::array<std::vector<std::string>, K> TEMPLATES = {{
-  // TOGGLE_ALARMA
-  {"activar alarma", "apagar alarma", "alarma on", "alarma off", "encender alarma", "desactivar alarma", "prender alarma", "silenciar alarma", "sonar alarma"},
-  // TOGGLE_LUCES
-  {"prender luces", "apagar luces", "encender iluminacion", "luces afuera", "luz exterior", "iluminar entrada", "activar luces", "desactivar luces"},
-  // TOGGLE_VENTILADOR
-  {"encender ventilador", "apagar ventilador", "activar ventilacion", "ventilador on", "ventilador off", "encender enfriamiento"},
-  // TOGGLE_DESHUMIDIFICADOR
-  {"activar deshumidificador", "apagar deshumidificador", "deshumidificador on", "deshumidificador off", "reducir humedad"},
-  // CONSULTAR_ESTADO
-  {"como esta la casa", "estado del sistema", "que esta encendido", "resumen", "status general", "datos de sensores", "estado de la casa", "resumen de registros", "estadisticas del sistema"}
+  {"activar alarma", "apagar alarma", "alarma on", "alarma off", "encender alarma", "desactivar alarma"},
+  {"prender luces", "apagar luces", "encender iluminacion", "luces afuera", "luz exterior"},
+  {"encender ventilador", "apagar ventilador", "activar ventilacion", "ventilador on", "ventilador off"},
+  {"activar deshumidificador", "apagar deshumidificador", "deshumidificador on", "reducir humedad"},
+  {"como esta la casa", "estado del sistema", "que esta encendido", "resumen", "status general"}
 }};
 
-// meanC: medias recientes por canal [mov, luz, temp, ruido, hum]
-// scores: similitud por intención (K)
 __global__
 void fuseDecision(const float* __restrict__ scores, int K,
                   const float* __restrict__ meanC,
@@ -226,14 +283,12 @@ void fuseDecision(const float* __restrict__ scores, int K,
   if (threadIdx.x == 0){
     *outTop = topIdx;
 
-    // Lee medias recientes para reglas
-    float mov   = meanC[0];         // 0/1
-    float luz   = meanC[1];         // lux
-    float temp  = meanC[2];         // °C
-    float ruido = meanC[3];         // dB
-    float hum   = meanC[4];         // 0..1
+    float mov   = meanC[0];
+    float luz   = meanC[1];
+    float temp  = meanC[2];
+    float ruido = meanC[3];
+    float hum   = meanC[4];
 
-    // Estados actuales
     int sAlarm = *curAlarm;
     int sLuces = *curLuces;
     int sVent  = *curVent;
@@ -241,7 +296,6 @@ void fuseDecision(const float* __restrict__ scores, int K,
 
     int nAlarm = sAlarm, nLuces = sLuces, nVent = sVent, nDesh = sDesh;
 
-    // Señales por sensor
     bool oscuro   = (luz <  thrLuz);
     bool caliente = (temp > thrTemp);
     bool ruidoso  = (ruido > thrRuido);
@@ -303,7 +357,6 @@ static void tokenize3grams_host(const std::string& s, std::vector<float>& out){
   }
 }
 
-// Construye M[K x D]: promedia frases por intención y normaliza filas
 static void buildIntentMatrixFromTemplates(std::vector<float>& M){
   M.assign(K * D, 0.f);
   for (int k = 0; k < K; ++k){
@@ -330,76 +383,38 @@ void initIntentPrototypes(std::vector<float>& M){
   buildIntentMatrixFromTemplates(M);
 }
 
-std::string demoQuery(){
-  return "apaga las luces";
-}
-
-// Simulación de sensores
-void synthSensors(std::vector<float>& X){
-  X.resize(size_t(N)*C);
-
-  srand(12345);
-
-  int burstLen = 0;
-  const int minBurst = 50;
-  const int maxBurst = 500;
-  const float pStartBurst = 0.001f;
-
-  const float luxBaseMin = 50.f;
-  const float luxBaseMax = 800.f;
-
-  const float tempMean = 27.0f;
-  const float tempJitter = 3.0f;
-
-  const float noiseBaseMin = 35.f, noiseBaseMax = 45.f;
-  const float noiseSpikeMin = 65.f, noiseSpikeMax = 85.f;
-  const float pNoiseSpike = 0.0008f;
-
-  float humidity = 55.f;
-  const float humMin = 40.f, humMax = 70.f;
-
-  for (int i = 0; i < N; ++i){
-    int motion = 0;
-    if (burstLen > 0){
-      motion = 1;
-      burstLen--;
-    } else {
-      float r = (rand() % 10000) / 10000.f;
-      if (r < pStartBurst){
-        burstLen = minBurst + (rand() % (maxBurst - minBurst + 1));
-        motion = 1;
-        burstLen--;
-      }
-    }
-
-    float phase = (i % (1<<16)) * (2.f * 3.14159265f / float(1<<16));
-    float diurnal = 0.5f * (1.f + sinf(phase));
-    float lux = luxBaseMin + diurnal * (luxBaseMax - luxBaseMin);
-    lux += ((rand()%1000)/1000.f - 0.5f) * 30.f;
-    if (lux < 0.f) lux = 0.f;
-
-    float temp = tempMean + ((rand()%1000)/1000.f - 0.5f) * (2.f*tempJitter);
-
-    float noise = noiseBaseMin + (rand()%1000)/1000.f * (noiseBaseMax - noiseBaseMin);
-    float rp = (rand()%100000) / 100000.f;
-    if (rp < pNoiseSpike){
-      noise = noiseSpikeMin + (rand()%1000)/1000.f * (noiseSpikeMax - noiseSpikeMin);
-    }
-
-    humidity += ((rand()%1000)/1000.f - 0.5f) * 0.2f;
-    if (humidity < humMin) humidity = humMin + 0.5f;
-    if (humidity > humMax) humidity = humMax - 0.5f;
-
-    X[i*C + 0] = float(motion);
-    X[i*C + 1] = lux;
-    X[i*C + 2] = temp;
-    X[i*C + 3] = noise;
-    X[i*C + 4] = humidity;
-  }
-}
-
 // ------------------------ Main ------------------------
 int main(){
+  std::cout << "=== Chat-Box Interactivo con CUDA ===\n\n";
+  
+  // Solicitar URL de Google Sheets
+  std::string sheet_url;
+  std::cout << "Ingresa la URL de tu Google Sheets con los datos de sensores:\n";
+  std::cout << "(Formato: movimiento, luz, temperatura, ruido, humedad)\n";
+  std::cout << "URL: ";
+  std::getline(std::cin, sheet_url);
+  
+  // Descargar datos de sensores
+  std::vector<std::vector<float>> sensorData;
+  std::cout << "\nDescargando datos de sensores...\n";
+  
+  if (!downloadGoogleSheet(sheet_url, sensorData)) {
+    std::cerr << "Error: No se pudo descargar el Google Sheet.\n";
+    std::cerr << "Asegúrate de que:\n";
+    std::cerr << "1. El link sea público o compartido\n";
+    std::cerr << "2. El formato sea: movimiento, luz, temp, ruido, humedad\n";
+    return 1;
+  }
+  
+  int N = (int)sensorData.size();
+  std::cout << "✓ Descargados " << N << " registros de sensores\n\n";
+  
+  if (N == 0 || sensorData[0].size() < C) {
+    std::cerr << "Error: El sheet debe tener al menos " << C << " columnas\n";
+    return 1;
+  }
+  
+  // Inicializar CUDA
   cudaStream_t sNLU, sDATA, sFUSE;
   CUDA_OK(cudaStreamCreate(&sNLU));
   CUDA_OK(cudaStreamCreate(&sDATA));
@@ -409,7 +424,6 @@ int main(){
   CUDA_OK(cudaEventCreate(&evStart));
   CUDA_OK(cudaEventCreate(&evStop));
 
-  // Eventos por etapa (NLU/DATA/FUSE)
   cudaEvent_t evNLUStart, evNLUStop, evDATAStart, evDATAStop, evFUSEStart, evFUSEStop;
   CUDA_OK(cudaEventCreate(&evNLUStart));
   CUDA_OK(cudaEventCreate(&evNLUStop));
@@ -418,40 +432,24 @@ int main(){
   CUDA_OK(cudaEventCreate(&evFUSEStart));
   CUDA_OK(cudaEventCreate(&evFUSEStop));
 
-  std::vector<float> hM; initIntentPrototypes(hM);
+  // Inicializar matriz de intenciones
+  std::vector<float> hM;
+  initIntentPrototypes(hM);
   float *dM=nullptr;
   CUDA_OK(cudaMalloc(&dM, K*D*sizeof(float)));
   CUDA_OK(cudaMemcpy(dM, hM.data(), K*D*sizeof(float), cudaMemcpyHostToDevice));
 
-  // Conjunto de consultas
-  std::vector<std::string> QUERIES = {
-    "activa la alarma",
-    "apaga la alarma",
-    "enciende luces exteriores",
-    "apaga luces",
-    "activa el ventilador",
-    "apaga el ventilador",
-    "activa el deshumidificador",
-    "consulta estado",
-    "muestra mediciones",
-    "enciende luces si esta oscuro"
-  };
-  const int Q = (int)QUERIES.size();
-
-  // Buffer host/device para la query (reutilizable por iteración)
-  char *hQ=nullptr; CUDA_OK(cudaHostAlloc(&hQ, MAX_QUERY, cudaHostAllocDefault));
-  char *dQ=nullptr; CUDA_OK(cudaMalloc(&dQ, MAX_QUERY));
+  // Buffers para query
+  char *hQ=nullptr;
+  CUDA_OK(cudaHostAlloc(&hQ, MAX_QUERY, cudaHostAllocDefault));
+  char *dQ=nullptr;
+  CUDA_OK(cudaMalloc(&dQ, MAX_QUERY));
 
   // CSV de métricas
   std::ofstream metricsCsv;
   open_metrics_csv(metricsCsv, "metrics.csv");
 
-  // Acumuladores para percentiles
   std::vector<float> all_total_ms, all_nlu_ms, all_data_ms, all_fuse_ms;
-  all_total_ms.reserve(Q);
-  all_nlu_ms.reserve(Q);
-  all_data_ms.reserve(Q);
-  all_fuse_ms.reserve(Q);
 
   float *hVQ=nullptr, *dVQ=nullptr, *dScores=nullptr, *hScores=nullptr;
   CUDA_OK(cudaHostAlloc(&hVQ, D*sizeof(float), cudaHostAllocDefault));
@@ -459,20 +457,28 @@ int main(){
   CUDA_OK(cudaMalloc(&dVQ, D*sizeof(float)));
   CUDA_OK(cudaMalloc(&dScores, K*sizeof(float)));
 
-  std::vector<float> hXvec; synthSensors(hXvec);
-  float *hX=nullptr; CUDA_OK(cudaHostAlloc(&hX, size_t(N)*C*sizeof(float), cudaHostAllocDefault));
-  memcpy(hX, hXvec.data(), size_t(N)*C*sizeof(float));
+  // Preparar datos de sensores en formato plano
+  float *hX=nullptr;
+  CUDA_OK(cudaHostAlloc(&hX, size_t(N)*C*sizeof(float), cudaHostAllocDefault));
+  
+  for (int i = 0; i < N; ++i) {
+    for (int c = 0; c < C && c < (int)sensorData[i].size(); ++c) {
+      hX[i*C + c] = sensorData[i][c];
+    }
+  }
 
   float *dX=nullptr, *dMean=nullptr, *dStd=nullptr;
   float hMean[C]={0}, hStd[C]={0};
   CUDA_OK(cudaMalloc(&dX, size_t(N)*C*sizeof(float)));
   CUDA_OK(cudaMalloc(&dMean, C*sizeof(float)));
   CUDA_OK(cudaMalloc(&dStd,  C*sizeof(float)));
+  
+  // Copiar datos de sensores a GPU (una sola vez)
+  CUDA_OK(cudaMemcpy(dX, hX, size_t(N)*C*sizeof(float), cudaMemcpyHostToDevice));
 
-  // Estados actuales persistentes (entre queries)
+  // Estados de dispositivos
   int hStateAlarm = 0, hStateLuces = 0, hStateVent = 0, hStateDesh = 0;
 
-  // Nombres de intenciones (para logs)
   static const char* intentNames[K] = {
     "TOGGLE_ALARMA",
     "TOGGLE_LUCES",
@@ -481,21 +487,35 @@ int main(){
     "CONSULTAR_ESTADO"
   };
 
-  // Procesamiento por múltiples consultas
-  for (int qi = 0; qi < Q; ++qi){
-    std::string q = QUERIES[qi];
+  std::cout << "Sistema listo. Comandos disponibles:\n";
+  std::cout << "  - 'activa/apaga la alarma'\n";
+  std::cout << "  - 'enciende/apaga las luces'\n";
+  std::cout << "  - 'activa/apaga el ventilador'\n";
+  std::cout << "  - 'activa/apaga el deshumidificador'\n";
+  std::cout << "  - 'consulta estado'\n";
+  std::cout << "  - 'salir' para terminar\n\n";
+
+  int qi = 0;
+  while (true) {
+    std::cout << "Comando> ";
+    std::string input;
+    std::getline(std::cin, input);
+    
+    if (input.empty()) continue;
+    if (input == "salir" || input == "exit" || input == "quit") break;
+    
+    std::string q = input;
     std::transform(q.begin(), q.end(), q.begin(),
                   [](unsigned char c){ return std::tolower(c); });
+    
     const int qn = std::min<int>((int)q.size(), MAX_QUERY);
     memset(hQ, 0, MAX_QUERY);
     memcpy(hQ, q.data(), qn);
 
-    // --------- TIMING total ---------
     CUDA_OK(cudaEventRecord(evStart, 0));
 
     // ===================== NLU =====================
     CUDA_OK(cudaEventRecord(evNLUStart, sNLU));
-
     CUDA_OK(cudaMemsetAsync(dVQ, 0, D*sizeof(float), sNLU));
     CUDA_OK(cudaMemcpyAsync(dQ, hQ, MAX_QUERY, cudaMemcpyHostToDevice, sNLU));
 
@@ -509,29 +529,19 @@ int main(){
       matvecDotCos<<<grd, blk, 0, sNLU>>>(dM, dVQ, dScores, K, D);
     }
     CUDA_OK(cudaMemcpyAsync(hScores, dScores, K*sizeof(float), cudaMemcpyDeviceToHost, sNLU));
-
     CUDA_OK(cudaEventRecord(evNLUStop, sNLU));
 
     // ===================== DATA =====================
     CUDA_OK(cudaEventRecord(evDATAStart, sDATA));
-
-    // (re-sintetiza sensores por consulta para simular variación)
-    std::vector<float> hXvecIter; hXvecIter.reserve((size_t)N*C);
-    synthSensors(hXvecIter);
-    memcpy(hX, hXvecIter.data(), size_t(N)*C*sizeof(float));
-
-    CUDA_OK(cudaMemcpyAsync(dX, hX, size_t(N)*C*sizeof(float), cudaMemcpyHostToDevice, sDATA));
     window_stats_last<<<C, 256, 0, sDATA>>>(dX, N, C, W, dMean, dStd);
     CUDA_OK(cudaMemcpyAsync(hMean, dMean, C*sizeof(float), cudaMemcpyDeviceToHost, sDATA));
     CUDA_OK(cudaMemcpyAsync(hStd,  dStd,  C*sizeof(float), cudaMemcpyDeviceToHost, sDATA));
-
     CUDA_OK(cudaEventRecord(evDATAStop, sDATA));
     CUDA_OK(cudaStreamSynchronize(sDATA));
 
     // ===================== FUSE =====================
     CUDA_OK(cudaEventRecord(evFUSEStart, sFUSE));
 
-    // meanC en device
     float *dMeanHost=nullptr;
     CUDA_OK(cudaMalloc(&dMeanHost, C*sizeof(float)));
     CUDA_OK(cudaMemcpyAsync(dMeanHost, hMean, C*sizeof(float), cudaMemcpyHostToDevice, sFUSE));
@@ -558,15 +568,14 @@ int main(){
     CUDA_OK(cudaMemcpyAsync(dStateDesh,  &hStateDesh,  sizeof(int), cudaMemcpyHostToDevice, sFUSE));
     CUDA_OK(cudaStreamSynchronize(sFUSE));
 
-    int *dTop=nullptr; CUDA_OK(cudaMalloc(&dTop, sizeof(int)));
+    int *dTop=nullptr;
+    CUDA_OK(cudaMalloc(&dTop, sizeof(int)));
 
     fuseDecision<<<1, 128, 0, sFUSE>>>(
-      dScores, K,
-      dMeanHost,
+      dScores, K, dMeanHost,
       thrLuz, thrTemp, thrRuido, thrHum,
       dStateAlarm, dStateLuces, dStateVent, dStateDesh,
-      dTop,
-      dNewAlarm, dNewLuces, dNewVent, dNewDesh
+      dTop, dNewAlarm, dNewLuces, dNewVent, dNewDesh
     );
 
     int hTop=-1, hNewAlarm=0, hNewLuces=0, hNewVent=0, hNewDesh=0;
@@ -586,11 +595,10 @@ int main(){
     hStateVent  = hNewVent;
     hStateDesh  = hNewDesh;
 
-    // --------- TIMING total ---------
     CUDA_OK(cudaEventRecord(evStop, 0));
     CUDA_OK(cudaEventSynchronize(evStop));
 
-    // ---- Métricas por etapa y totales ----
+    // Métricas
     float msNLU=0.f, msDATA=0.f, msFUSE=0.f, msTOTAL=0.f;
     CUDA_OK(cudaEventElapsedTime(&msNLU,  evNLUStart,  evNLUStop));
     CUDA_OK(cudaEventElapsedTime(&msDATA, evDATAStart, evDATAStop));
@@ -602,47 +610,88 @@ int main(){
     all_fuse_ms.push_back(msFUSE);
     all_total_ms.push_back(msTOTAL);
 
-    // TOP-K de sugerencias (host)
-    auto top3 = topk_indices(hScores, K, TOPK);
+    // Mostrar resultados
+    std::cout << "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+    std::cout << "Intención detectada: " << intentNames[hTop] << "\n";
+    std::cout << "Confianza: " << std::fixed << std::setprecision(2) << (hScores[hTop] * 100) << "%\n";
+    
+    std::cout << "\n📊 Sensores (promedio últimas " << std::min(W, N) << " muestras):\n";
+    std::cout << "  • Movimiento: " << std::setprecision(3) << hMean[0] << "\n";
+    std::cout << "  • Luz: " << std::setprecision(1) << hMean[1] << " lux\n";
+    std::cout << "  • Temperatura: " << std::setprecision(1) << hMean[2] << " °C\n";
+    std::cout << "  • Ruido: " << std::setprecision(1) << hMean[3] << " dB\n";
+    std::cout << "  • Humedad: " << std::setprecision(1) << (hMean[4]*100) << "%\n";
+    
+    std::cout << "\n🏠 Estado de dispositivos:\n";
+    
+    auto printDevice = [](const char* name, int prev, int curr) {
+      if (prev != curr) {
+        std::cout << "  • " << name << ": " << (prev ? "ON" : "OFF") 
+                  << " → " << (curr ? "✓ ON" : "✗ OFF") << " [CAMBIO]\n";
+      } else {
+        std::cout << "  • " << name << ": " << (curr ? "ON" : "OFF") << "\n";
+      }
+    };
+    
+    printDevice("Alarma        ", prevAlarm, hNewAlarm);
+    printDevice("Luces         ", prevLuces, hNewLuces);
+    printDevice("Ventilador    ", prevVent,  hNewVent);
+    printDevice("Deshumidif.   ", prevDesh,  hNewDesh);
+    
+    std::cout << "\n⚡ Latencia: " << std::setprecision(2) << msTOTAL << " ms "
+              << "(NLU:" << msNLU << " + DATA:" << msDATA << " + FUSE:" << msFUSE << ")\n";
+    std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
 
-    int decision = (prevAlarm != hNewAlarm) || (prevLuces != hNewLuces) || (prevVent != hNewVent) || (prevDesh != hNewDesh);
+    // Guardar en CSV
+    int decision = (prevAlarm != hNewAlarm) || (prevLuces != hNewLuces) || 
+                   (prevVent != hNewVent) || (prevDesh != hNewDesh);
     append_metrics_csv(metricsCsv, qi, q, intentNames[hTop], decision,
                       hNewAlarm, hNewLuces, hNewVent, hNewDesh,
                       hMean, msTOTAL, msNLU, msDATA, msFUSE);
 
-    // Limpieza por iteración
+    // Limpieza
     cudaFree(dTop);
     cudaFree(dMeanHost);
     cudaFree(dStateAlarm); cudaFree(dStateLuces); cudaFree(dStateVent); cudaFree(dStateDesh);
     cudaFree(dNewAlarm);   cudaFree(dNewLuces);   cudaFree(dNewVent);   cudaFree(dNewDesh);
+    
+    qi++;
   }
 
-  // Resumen (p50/p95) y QPS
-  double p50 = percentile(all_total_ms, 50.0);
-  double p95 = percentile(all_total_ms, 95.0);
+  // Resumen final
+  if (!all_total_ms.empty()) {
+    std::cout << "\n╔════════════════════════════════════════╗\n";
+    std::cout << "║        RESUMEN DE LA SESIÓN           ║\n";
+    std::cout << "╚════════════════════════════════════════╝\n\n";
+    
+    double p50 = percentile(all_total_ms, 50.0);
+    double p95 = percentile(all_total_ms, 95.0);
+    double sum_ms = std::accumulate(all_total_ms.begin(), all_total_ms.end(), 0.0);
+    double qps = (sum_ms>0.0) ? (1000.0 * qi / sum_ms) : 0.0;
 
-  double sum_ms = std::accumulate(all_total_ms.begin(), all_total_ms.end(), 0.0);
-  double qps = (sum_ms>0.0) ? (1000.0 * Q / sum_ms) : 0.0;
+    std::cout << "Total de consultas: " << qi << "\n";
+    std::cout << "QPS (consultas/seg): " << std::fixed << std::setprecision(2) << qps << "\n";
+    std::cout << "Latencia p50: " << p50 << " ms\n";
+    std::cout << "Latencia p95: " << p95 << " ms\n";
+    std::cout << "\nPromedios por etapa:\n";
+    std::cout << "  • NLU:  " << (std::accumulate(all_nlu_ms.begin(),  all_nlu_ms.end(),  0.0)/qi) << " ms\n";
+    std::cout << "  • DATA: " << (std::accumulate(all_data_ms.begin(), all_data_ms.end(), 0.0)/qi) << " ms\n";
+    std::cout << "  • FUSE: " << (std::accumulate(all_fuse_ms.begin(), all_fuse_ms.end(), 0.0)/qi) << " ms\n";
+    std::cout << "\n✓ Métricas guardadas en 'metrics.csv'\n\n";
+  }
 
-  printf("Total queries: %d | QPS ~ %.2f\n", Q, qps);
-  printf("Lat p50=%.3f ms | p95=%.3f ms\n", p50, p95);
-  printf("Etapas (promedio): NLU=%.3f ms | DATA=%.3f ms | FUSE=%.3f ms\n",
-        std::accumulate(all_nlu_ms.begin(),  all_nlu_ms.end(),  0.0)/Q,
-        std::accumulate(all_data_ms.begin(), all_data_ms.end(), 0.0)/Q,
-        std::accumulate(all_fuse_ms.begin(), all_fuse_ms.end(), 0.0)/Q);
-
+  // Limpieza final
   metricsCsv.close();
   cudaFree(dQ);
   cudaFree(dVQ); cudaFree(dScores); cudaFree(dM);
   cudaFree(dX);  cudaFree(dMean);   cudaFree(dStd);
   cudaFreeHost(hQ); cudaFreeHost(hVQ); cudaFreeHost(hScores); cudaFreeHost(hX);
-  cudaEventDestroy(evNLUStart);
-  cudaEventDestroy(evNLUStop);
-  cudaEventDestroy(evDATAStart);
-  cudaEventDestroy(evDATAStop);
-  cudaEventDestroy(evFUSEStart);
-  cudaEventDestroy(evFUSEStop);
+  cudaEventDestroy(evNLUStart); cudaEventDestroy(evNLUStop);
+  cudaEventDestroy(evDATAStart); cudaEventDestroy(evDATAStop);
+  cudaEventDestroy(evFUSEStart); cudaEventDestroy(evFUSEStop);
   cudaEventDestroy(evStart); cudaEventDestroy(evStop);
   cudaStreamDestroy(sNLU); cudaStreamDestroy(sDATA); cudaStreamDestroy(sFUSE);
+  
+  std::cout << "¡Hasta luego! 👋\n";
   return 0;
 }
